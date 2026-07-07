@@ -1,0 +1,132 @@
+name: Release
+
+# Сборка готовых бинарников по тегу `v*`:
+#   * обучалка `capburn` — один бинарник на платформу;
+#   * PHP-расширение `capburn_php` — по одному .so/.dylib на (PHP × платформа).
+# Все артефакты прикрепляются к GitHub Release.
+
+on:
+  push:
+    tags: ['v*']
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: Тег для сборки и релиза
+        required: true
+        type: string
+
+permissions:
+  contents: write
+
+env:
+  REF: ${{ inputs.tag || github.ref_name }}
+
+jobs:
+  trainer:
+    name: Trainer · ${{ matrix.platform.name }}
+    runs-on: ${{ matrix.platform.runner }}
+    strategy:
+      fail-fast: false
+      matrix:
+        platform:
+          - { name: linux-x86_64, runner: ubuntu-latest }
+          - { name: linux-aarch64, runner: ubuntu-24.04-arm }
+          - { name: macos-aarch64, runner: macos-14 }
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ env.REF }}
+
+      - name: Set up Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache cargo
+        uses: Swatinem/rust-cache@v2
+        with:
+          key: rel-trainer-${{ matrix.platform.name }}
+
+      - name: Build trainer
+        run: cargo build --release -p capburn-train
+
+      - name: Package
+        run: |
+          BIN="capburn-${REF}-${{ matrix.platform.name }}"
+          cp target/release/capburn "$BIN"
+          shasum -a 256 "$BIN" > "$BIN.sha256"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: trainer-${{ matrix.platform.name }}
+          path: |
+            capburn-*
+          if-no-files-found: error
+
+  extension:
+    name: Extension · ${{ matrix.platform.name }} · php ${{ matrix.php }}
+    runs-on: ${{ matrix.platform.runner }}
+    strategy:
+      fail-fast: false
+      matrix:
+        php: ['8.1', '8.2', '8.3', '8.4', '8.5']
+        platform:
+          - { name: linux-x86_64, runner: ubuntu-latest }
+          - { name: linux-aarch64, runner: ubuntu-24.04-arm }
+          - { name: macos-aarch64, runner: macos-14 }
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ env.REF }}
+
+      - name: Set up PHP
+        uses: shivammathur/setup-php@v2
+        with:
+          php-version: ${{ matrix.php }}
+
+      - name: Set up Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache cargo
+        uses: Swatinem/rust-cache@v2
+        with:
+          key: rel-ext-${{ matrix.platform.name }}-php${{ matrix.php }}
+
+      - name: Build extension
+        env:
+          CAPBURN_PHP_VERSION: ${{ env.REF }}
+        run: cargo build --release -p capburn_php
+
+      - name: Package
+        run: |
+          SRC=$(find target/release -maxdepth 1 \( -name 'libcapburn_php.dylib' -o -name 'libcapburn_php.so' \) | head -n1)
+          test -n "$SRC" || { echo "артефакт расширения не найден"; exit 1; }
+          php -d extension="$PWD/$SRC" -r 'exit(class_exists("Capburn\\Ext\\Recognizer") ? 0 : 1);'
+          OUT="capburn_php-${REF}-php${{ matrix.php }}-${{ matrix.platform.name }}.so"
+          cp "$SRC" "$OUT"
+          shasum -a 256 "$OUT" > "$OUT.sha256"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ext-${{ matrix.platform.name }}-php${{ matrix.php }}
+          path: |
+            capburn_php-*
+          if-no-files-found: error
+
+  publish:
+    name: Publish release
+    needs: [trainer, extension]
+    runs-on: ubuntu-latest
+    steps:
+      - name: Download all artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+
+      - name: Attach to release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REF: ${{ env.REF }}
+        run: |
+          gh release view "$REF" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1 \
+            || gh release create "$REF" --repo "$GITHUB_REPOSITORY" --title "$REF" --generate-notes
+          gh release upload "$REF" --repo "$GITHUB_REPOSITORY" dist/* --clobber

@@ -1,0 +1,20 @@
+[package]
+name = "capburn_php"
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.85.0"
+description = "PHP-расширение для распознавания капчи обученной моделью capburn"
+license = "MIT"
+
+[lib]
+name = "capburn_php"
+crate-type = ["cdylib"]
+path = "src/lib.rs"
+
+[dependencies]
+capburn-core = { path = "../capburn-core" }
+ext-php-rs = "0.15.15"
+base64 = "0.22"
+
+[build-dependencies]
+ext-php-rs = "0.15.15"

@@ -1,0 +1,14 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/capburn-core",
+    "crates/capburn-train",
+    "crates/capburn-php",
+]
+
+[profile.release]
+opt-level = 3
+lto = "thin"
+codegen-units = 16
+strip = true
+incremental = true

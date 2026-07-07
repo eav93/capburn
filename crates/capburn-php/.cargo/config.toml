@@ -1,0 +1,10 @@
+# PHP-расширение — это cdylib (динамическая библиотека). Цели musl по умолчанию
+# используют статическую линковку (crt-static), при которой Rust вообще не может
+# собрать cdylib. Отключение crt-static для musl-целей включает сборку
+# динамического расширения. glibc, macOS и Windows не затрагиваются.
+
+[target.x86_64-unknown-linux-musl]
+rustflags = ["-C", "target-feature=-crt-static"]
+
+[target.aarch64-unknown-linux-musl]
+rustflags = ["-C", "target-feature=-crt-static"]

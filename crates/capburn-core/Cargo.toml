@@ -1,0 +1,13 @@
+[package]
+name = "capburn-core"
+version = "0.1.0"
+edition = "2024"
+description = "Captcha recognizer core: model, charset and CPU inference on Burn"
+license = "MIT"
+
+[dependencies]
+burn = { version = "0.21", default-features = false, features = ["std", "ndarray"] }
+# Only the codecs captchas actually use — avoids pulling in avif/exr/tiff/webp/…
+# and keeps the PHP extension binary small.
+image = { version = "0.25", default-features = false, features = ["png", "jpeg"] }
+serde = { version = "1", features = ["derive"] }

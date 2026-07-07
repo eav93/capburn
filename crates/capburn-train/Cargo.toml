@@ -1,0 +1,29 @@
+[package]
+name = "capburn-train"
+version = "0.1.0"
+edition = "2024"
+description = "Captcha recognizer trainer on Burn (GPU/CPU), CRNN + CTC"
+license = "MIT"
+
+[[bin]]
+name = "capburn"
+path = "src/main.rs"
+
+[dependencies]
+capburn-core = { path = "../capburn-core" }
+burn = { version = "0.21", default-features = false, features = [
+    "std",
+    "wgpu",
+    "autotune",
+    "fusion",
+    "autodiff",
+    "ndarray",
+] }
+image = "0.25"
+clap = { version = "4.6", features = ["derive"] }
+rand = "0.10"
+serde = { version = "1", features = ["derive"] }
+
+[features]
+# Native CUDA backend for NVIDIA servers (requires the CUDA toolkit).
+cuda = ["burn/cuda"]
