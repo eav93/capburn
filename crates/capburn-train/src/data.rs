@@ -40,6 +40,7 @@ impl Dataset {
     ) -> std::io::Result<Self> {
         let mut examples = Vec::new();
         let mut skipped = 0usize;
+        let mut decode_failed = 0usize;
         for entry in std::fs::read_dir(folder)? {
             let entry = entry?;
             let path = entry.path();
@@ -70,14 +71,27 @@ impl Dataset {
                 skipped += 1;
                 continue;
             }
-            let image = load_image_as_floats(&path)
-                .unwrap_or_else(|e| panic!("failed to read {}: {e}", path.display()));
+            // Skip unreadable/corrupt files (e.g. a `12345.txt` whose stem looks
+            // like a label) instead of killing the whole training run.
+            let image = match load_image_as_floats(&path) {
+                Ok(img) => img,
+                Err(e) => {
+                    decode_failed += 1;
+                    if decode_failed <= 5 {
+                        eprintln!("Skipping {}: {e}", path.display());
+                    }
+                    continue;
+                }
+            };
             examples.push(Example { image, labels });
         }
         if skipped > 0 {
             println!(
                 "Skipped {skipped} files (label length outside {min_len}..={max_len} or a character outside the charset)"
             );
+        }
+        if decode_failed > 0 {
+            println!("Skipped {decode_failed} files that could not be decoded as images");
         }
         Ok(Self { examples })
     }
@@ -102,8 +116,15 @@ impl Dataset {
     }
 
     pub fn split(self, train_ratio: f32) -> (Self, Self) {
-        let n_train = ((self.examples.len() as f32) * train_ratio).round() as usize;
-        let n_train = n_train.min(self.examples.len());
+        let len = self.examples.len();
+        let n_train = ((len as f32) * train_ratio).round() as usize;
+        // Keep at least one example on each side when the dataset has ≥2, so the
+        // validation split (and the quality gate) is never empty.
+        let n_train = if len >= 2 {
+            n_train.clamp(1, len - 1)
+        } else {
+            n_train.min(len)
+        };
         let (train, val) = self.examples.split_at(n_train);
         (
             Self {

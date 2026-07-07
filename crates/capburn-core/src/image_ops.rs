@@ -33,12 +33,15 @@ pub fn image_to_floats(img: &DynamicImage) -> Vec<f32> {
     gray.as_raw().iter().map(|p| *p as f32 / 255.0).collect()
 }
 
-/// Load an image from disk and convert it to a luminance vector.
+/// Load an image from disk and convert it to a luminance vector. Applies the
+/// same size limits as the in-memory decoder to guard against decode bombs.
 pub fn load_image_as_floats<P: AsRef<Path>>(path: P) -> Result<Vec<f32>, String> {
-    let img = ImageReader::open(path.as_ref())
+    let mut reader = ImageReader::open(path.as_ref())
         .map_err(|e| format!("cannot open {}: {e}", path.as_ref().display()))?
         .with_guessed_format()
-        .map_err(|e| format!("cannot guess image format: {e}"))?
+        .map_err(|e| format!("cannot guess image format: {e}"))?;
+    reader.limits(safe_limits());
+    let img = reader
         .decode()
         .map_err(|e| format!("cannot decode image: {e}"))?;
     Ok(image_to_floats(&img))

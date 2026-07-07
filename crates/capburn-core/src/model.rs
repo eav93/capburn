@@ -23,6 +23,11 @@ use burn::tensor::activation::log_softmax;
 /// Feature channels produced by the CNN backbone.
 const CNN_OUT: usize = 128;
 
+/// Number of time steps the CTC head emits: the backbone halves the width twice
+/// (two 2×2 pools) and keeps it otherwise, so the sequence length is `W / 4`.
+/// The CTC target length must not exceed this.
+pub const CTC_TIME_STEPS: usize = crate::image_ops::IMG_WIDTH / 4;
+
 /// Recognition head / training objective.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Arch {

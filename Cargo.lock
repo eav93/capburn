@@ -972,7 +972,6 @@ dependencies = [
  "burn",
  "capburn-core",
  "clap",
- "image",
  "rand 0.10.2",
  "serde",
 ]

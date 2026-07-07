@@ -19,7 +19,6 @@ burn = { version = "0.21", default-features = false, features = [
     "autodiff",
     "ndarray",
 ] }
-image = "0.25"
 clap = { version = "4.6", features = ["derive"] }
 rand = "0.10"
 serde = { version = "1", features = ["derive"] }

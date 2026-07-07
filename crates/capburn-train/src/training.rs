@@ -55,6 +55,20 @@ pub fn run<B: AutodiffBackend>(
     let charset = Charset::from_chars(&config.model.charset);
     let min_len = config.min_chars;
     let max_len = config.model.num_chars;
+
+    // The fixed head has exactly `num_chars` output slots and cross-entropy per
+    // slot, so it requires a single length. A range needs the CTC head.
+    assert!(
+        !(arch == Arch::Fixed && min_len != max_len),
+        "--arch fixed needs a single length (--num-chars N), got {min_len}..={max_len} — use --arch ctc for variable length"
+    );
+    // CTC target length cannot exceed the fixed sequence length the backbone emits.
+    assert!(
+        !(arch == Arch::Ctc && max_len > capburn_core::CTC_TIME_STEPS),
+        "--num-chars max {max_len} exceeds the CTC sequence length {} — captchas this long are not supported",
+        capburn_core::CTC_TIME_STEPS
+    );
+
     println!(
         "Arch: {}  |  charset: {} chars ({})  |  length: {}",
         arch.as_str(),
