@@ -5,7 +5,7 @@
 //! predicted sequence. The loop also implements a quality gate: only the epoch
 //! with the best validation accuracy is written to disk.
 
-use crate::data::{Dataset, build_images, build_images_aug, build_targets};
+use crate::data::{AugmentProfile, Dataset, build_images, build_images_aug, build_targets};
 use burn::config::Config;
 use burn::module::AutodiffModule;
 use burn::nn::loss::{CTCLossConfig, CrossEntropyLossConfig};
@@ -14,6 +14,7 @@ use burn::prelude::*;
 use burn::record::CompactRecorder;
 use burn::tensor::ElementConversion;
 use burn::tensor::backend::AutodiffBackend;
+use capburn_core::PreprocessMode;
 use capburn_core::{
     Arch, CaptchaModel, CaptchaModelConfig, Charset, fixed_decode_indices, greedy_decode_indices,
 };
@@ -37,6 +38,9 @@ pub struct TrainingConfig {
     /// Apply random affine + photometric augmentation to training images.
     #[config(default = true)]
     pub augment: bool,
+    /// Augmentation strength: `light`, `medium`, or `strong`.
+    #[config(default = "String::from(\"medium\")")]
+    pub augment_profile: String,
 }
 
 pub fn run<B: AutodiffBackend>(
@@ -52,26 +56,19 @@ pub fn run<B: AutodiffBackend>(
     B::seed(&device, config.seed);
 
     let arch = Arch::parse(&config.model.arch).expect("invalid arch");
+    let preprocess = PreprocessMode::parse(&config.model.preprocess).expect("invalid preprocess");
+    let augment_profile =
+        AugmentProfile::parse(&config.augment_profile).expect("invalid augment profile");
     let charset = Charset::from_chars(&config.model.charset);
     let min_len = config.min_chars;
     let max_len = config.model.num_chars;
-
-    // The fixed head has exactly `num_chars` output slots and cross-entropy per
-    // slot, so it requires a single length. A range needs the CTC head.
-    assert!(
-        !(arch == Arch::Fixed && min_len != max_len),
-        "--arch fixed needs a single length (--num-chars N), got {min_len}..={max_len} — use --arch ctc for variable length"
-    );
-    // CTC target length cannot exceed the fixed sequence length the backbone emits.
-    assert!(
-        !(arch == Arch::Ctc && max_len > capburn_core::CTC_TIME_STEPS),
-        "--num-chars max {max_len} exceeds the CTC sequence length {} — captchas this long are not supported",
-        capburn_core::CTC_TIME_STEPS
-    );
+    // Argument validity (arch/length compatibility, positive sizes) is checked
+    // in main before we get here, with clean CLI errors.
 
     println!(
-        "Arch: {}  |  charset: {} chars ({})  |  length: {}",
+        "Arch: {}  |  preprocess: {}  |  charset: {} chars ({})  |  length: {}",
         arch.as_str(),
+        preprocess.as_str(),
         charset.len(),
         charset.describe_families(),
         if min_len == max_len {
@@ -80,17 +77,25 @@ pub fn run<B: AutodiffBackend>(
             format!("variable {min_len}..={max_len}")
         }
     );
+    println!(
+        "Augmentation: {}",
+        if config.augment {
+            augment_profile.as_str()
+        } else {
+            "off"
+        }
+    );
 
     print!("Loading and decoding images... ");
-    let mut dataset =
-        Dataset::from_folder(data_dir, &charset, min_len, max_len).expect("read dataset");
+    let mut dataset = Dataset::from_folder(data_dir, &charset, min_len, max_len, preprocess)
+        .expect("read dataset");
     println!("{} examples", dataset.len());
     assert!(
         dataset.len() > 1,
         "No suitable examples found in {data_dir} — check --charset and --num-chars"
     );
     dataset.shuffle(config.seed);
-    let (train, valid) = dataset.split(0.9);
+    let (mut train, valid) = dataset.split(0.9);
     println!(
         "Train: {} examples, Valid: {} examples",
         train.len(),
@@ -115,16 +120,16 @@ pub fn run<B: AutodiffBackend>(
 
     let mut best_acc = -1.0f32;
     for epoch in 1..=config.num_epochs {
-        let mut train = train.clone();
+        // In-place seeded shuffle (no per-epoch deep copy of all image buffers).
         train.shuffle(config.seed.wrapping_add(epoch as u64));
 
         let mut aug_rng =
             StdRng::seed_from_u64(config.seed ^ (epoch as u64).wrapping_mul(0x9E3779B9));
         let mut running_loss = 0.0f64;
-        let mut batches = 0usize;
-        for batch in train.examples().chunks(config.batch_size) {
+        let mut loss_reads = 0usize;
+        for (batch_idx, batch) in train.examples().chunks(config.batch_size).enumerate() {
             let images = if config.augment {
-                build_images_aug::<B>(batch, &device, &mut aug_rng)
+                build_images_aug::<B>(batch, &device, &mut aug_rng, augment_profile)
             } else {
                 build_images::<B>(batch, &device)
             };
@@ -151,17 +156,19 @@ pub fn run<B: AutodiffBackend>(
                 }
             };
 
-            let loss_value: f32 = loss.clone().into_scalar().elem();
+            // Reading the scalar forces a GPU→CPU sync, so sample the loss for
+            // the epoch average instead of syncing on every batch.
+            if batch_idx.is_multiple_of(16) {
+                running_loss += loss.clone().into_scalar().elem::<f32>() as f64;
+                loss_reads += 1;
+            }
             let grads = loss.backward();
             let grads = GradientsParams::from_grads(grads, &model);
             model = optim.step(config.learning_rate, model, grads);
-
-            running_loss += loss_value as f64;
-            batches += 1;
         }
 
         let (acc, char_acc) = evaluate::<B>(&model, &valid, config.batch_size, &device);
-        let avg_loss = running_loss / batches.max(1) as f64;
+        let avg_loss = running_loss / loss_reads.max(1) as f64;
         let flag = if acc > best_acc { " *best" } else { "" };
         println!(
             "Epoch {epoch:>3}/{}  loss {avg_loss:.4}  val char-acc {char_acc:.1}%  full-captcha {acc:.2}%{flag}",

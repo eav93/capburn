@@ -2,7 +2,10 @@
 //! `NdArray` (CPU), the trainer can also verify on its own backend.
 
 use crate::charset::Charset;
-use crate::image_ops::{IMG_HEIGHT, IMG_WIDTH, image_to_floats, load_image_from_bytes};
+use crate::image_ops::{
+    IMG_HEIGHT, IMG_WIDTH, PreprocessMode, image_to_floats_with_mode,
+    load_image_from_bytes_with_mode,
+};
 use crate::model::{CaptchaModel, CaptchaModelConfig};
 use burn::config::Config;
 use burn::prelude::*;
@@ -14,6 +17,7 @@ pub struct Recognizer<B: Backend> {
     model: CaptchaModel<B>,
     charset: Charset,
     num_chars: usize,
+    preprocess: PreprocessMode,
     device: B::Device,
 }
 
@@ -31,6 +35,8 @@ impl<B: Backend> Recognizer<B> {
 
         let charset = Charset::from_chars(&config.charset);
         let num_chars = config.num_chars;
+        let preprocess = PreprocessMode::parse(&config.preprocess)
+            .map_err(|e| format!("invalid model preprocess in {}: {e}", cfg_path.display()))?;
 
         let model: CaptchaModel<B> = config.init(&device);
         let record = CompactRecorder::new()
@@ -42,6 +48,7 @@ impl<B: Backend> Recognizer<B> {
             model,
             charset,
             num_chars,
+            preprocess,
             device,
         })
     }
@@ -79,19 +86,19 @@ impl<B: Backend> Recognizer<B> {
 
     /// Recognize a captcha from a file.
     pub fn recognize_path<P: AsRef<Path>>(&self, path: P) -> Result<String, String> {
-        let data = crate::image_ops::load_image_as_floats(path)?;
+        let data = crate::image_ops::load_image_as_floats_with_mode(path, self.preprocess)?;
         Ok(self.recognize_floats(data))
     }
 
     /// Recognize a captcha from in-memory image bytes (PNG/JPEG/…).
     pub fn recognize_bytes(&self, bytes: &[u8]) -> Result<String, String> {
-        let data = load_image_from_bytes(bytes)?;
+        let data = load_image_from_bytes_with_mode(bytes, self.preprocess)?;
         Ok(self.recognize_floats(data))
     }
 
     /// Recognize an already-decoded image.
     pub fn recognize_image(&self, img: &image::DynamicImage) -> String {
-        self.recognize_floats(image_to_floats(img))
+        self.recognize_floats(image_to_floats_with_mode(img, self.preprocess))
     }
 }
 

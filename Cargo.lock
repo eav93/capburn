@@ -958,7 +958,7 @@ dependencies = [
 
 [[package]]
 name = "capburn-core"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "burn",
  "image",
@@ -967,7 +967,7 @@ dependencies = [
 
 [[package]]
 name = "capburn-train"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "burn",
  "capburn-core",
@@ -978,7 +978,7 @@ dependencies = [
 
 [[package]]
 name = "capburn_php"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "base64 0.22.1",
  "capburn-core",

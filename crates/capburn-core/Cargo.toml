@@ -1,6 +1,6 @@
 [package]
 name = "capburn-core"
-version = "0.1.0"
+version = "0.1.1"
 edition = "2024"
 description = "Captcha recognizer core: model, charset and CPU inference on Burn"
 license = "MIT"

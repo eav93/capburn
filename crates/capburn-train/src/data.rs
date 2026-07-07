@@ -3,7 +3,9 @@
 
 use burn::prelude::*;
 use capburn_core::Charset;
-use capburn_core::image_ops::{IMG_HEIGHT, IMG_WIDTH, load_image_as_floats};
+use capburn_core::image_ops::{
+    IMG_HEIGHT, IMG_WIDTH, PreprocessMode, load_image_as_floats_with_mode,
+};
 use rand::RngExt;
 use rand::SeedableRng;
 use rand::rngs::StdRng;
@@ -22,6 +24,86 @@ pub struct Dataset {
     examples: Vec<Example>,
 }
 
+/// Training augmentation strength.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum AugmentProfile {
+    Light,
+    Medium,
+    Strong,
+}
+
+impl AugmentProfile {
+    pub fn parse(s: &str) -> Result<Self, String> {
+        match s.to_ascii_lowercase().as_str() {
+            "light" => Ok(Self::Light),
+            "medium" => Ok(Self::Medium),
+            "strong" => Ok(Self::Strong),
+            other => Err(format!(
+                "unknown augment profile {other:?} (expected 'light', 'medium', 'strong' or 'off')"
+            )),
+        }
+    }
+
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Light => "light",
+            Self::Medium => "medium",
+            Self::Strong => "strong",
+        }
+    }
+
+    fn params(self) -> AugmentParams {
+        match self {
+            Self::Light => AugmentParams {
+                max_angle: 0.06,
+                min_scale: 0.95,
+                max_scale: 1.05,
+                max_tx: 2.0,
+                max_ty: 1.0,
+                min_contrast: 0.9,
+                max_contrast: 1.1,
+                max_brightness: 0.06,
+                max_noise: 0.015,
+            },
+            Self::Medium => AugmentParams {
+                max_angle: 0.10,
+                min_scale: 0.9,
+                max_scale: 1.1,
+                max_tx: 3.0,
+                max_ty: 2.0,
+                min_contrast: 0.8,
+                max_contrast: 1.2,
+                max_brightness: 0.1,
+                max_noise: 0.05,
+            },
+            Self::Strong => AugmentParams {
+                max_angle: 0.14,
+                min_scale: 0.85,
+                max_scale: 1.15,
+                max_tx: 5.0,
+                max_ty: 3.0,
+                min_contrast: 0.75,
+                max_contrast: 1.25,
+                max_brightness: 0.12,
+                max_noise: 0.07,
+            },
+        }
+    }
+}
+
+#[derive(Clone, Copy)]
+struct AugmentParams {
+    max_angle: f32,
+    min_scale: f32,
+    max_scale: f32,
+    max_tx: f32,
+    max_ty: f32,
+    min_contrast: f32,
+    max_contrast: f32,
+    max_brightness: f32,
+    max_noise: f32,
+}
+
 /// Extract the label from a file name — the part before the first `_`
 /// (e.g. `12345_abcdef.png` → `12345`).
 pub fn label_from_stem(stem: &str) -> &str {
@@ -37,6 +119,7 @@ impl Dataset {
         charset: &Charset,
         min_len: usize,
         max_len: usize,
+        preprocess: PreprocessMode,
     ) -> std::io::Result<Self> {
         let mut examples = Vec::new();
         let mut skipped = 0usize;
@@ -73,7 +156,7 @@ impl Dataset {
             }
             // Skip unreadable/corrupt files (e.g. a `12345.txt` whose stem looks
             // like a label) instead of killing the whole training run.
-            let image = match load_image_as_floats(&path) {
+            let image = match load_image_as_floats_with_mode(&path, preprocess) {
                 Ok(img) => img,
                 Err(e) => {
                     decode_failed += 1;
@@ -157,11 +240,12 @@ pub fn build_images_aug<B: Backend>(
     batch: &[Example],
     device: &B::Device,
     rng: &mut StdRng,
+    profile: AugmentProfile,
 ) -> Tensor<B, 4> {
     let bsz = batch.len();
     let mut data = Vec::with_capacity(bsz * IMG_HEIGHT * IMG_WIDTH);
     for ex in batch {
-        data.extend(augment(&ex.image, rng));
+        augment_into(&ex.image, &mut data, rng, profile);
     }
     Tensor::from_data(
         TensorData::new(data, [bsz, 1, IMG_HEIGHT, IMG_WIDTH]),
@@ -170,25 +254,26 @@ pub fn build_images_aug<B: Backend>(
 }
 
 /// Apply a random affine warp and photometric jitter to one grayscale image
-/// (`IMG_HEIGHT * IMG_WIDTH` floats). Border pixels are replicated, so no fixed
-/// background color is assumed.
-fn augment(image: &[f32], rng: &mut StdRng) -> Vec<f32> {
+/// (`IMG_HEIGHT * IMG_WIDTH` floats), appending the result to `out`. Border
+/// pixels are replicated, so no fixed background color is assumed.
+fn augment_into(image: &[f32], out: &mut Vec<f32>, rng: &mut StdRng, profile: AugmentProfile) {
+    let params = profile.params();
     let (h, w) = (IMG_HEIGHT as f32, IMG_WIDTH as f32);
     let (cx, cy) = (w / 2.0, h / 2.0);
 
-    let angle = rng.random_range(-0.10f32..0.10); // ≈ ±6°
-    let scale = rng.random_range(0.9f32..1.1);
+    let angle = rng.random_range(-params.max_angle..params.max_angle);
+    let scale = rng.random_range(params.min_scale..params.max_scale);
     // Keep horizontal translation small: the fixed head assigns each width slot
     // to a position, so large shifts would move characters across slot borders.
-    let tx = rng.random_range(-3.0f32..3.0);
-    let ty = rng.random_range(-2.0f32..2.0);
+    let tx = rng.random_range(-params.max_tx..params.max_tx);
+    let ty = rng.random_range(-params.max_ty..params.max_ty);
     let (sin, cos) = angle.sin_cos();
 
-    let contrast = rng.random_range(0.8f32..1.2);
-    let brightness = rng.random_range(-0.1f32..0.1);
-    let noise = rng.random_range(0.0f32..0.05);
+    let contrast = rng.random_range(params.min_contrast..params.max_contrast);
+    let brightness = rng.random_range(-params.max_brightness..params.max_brightness);
+    let noise = rng.random_range(0.0f32..params.max_noise);
 
-    let mut out = vec![0.0f32; IMG_HEIGHT * IMG_WIDTH];
+    out.reserve(IMG_HEIGHT * IMG_WIDTH);
     for oy in 0..IMG_HEIGHT {
         for ox in 0..IMG_WIDTH {
             // Map output pixel back to the source (inverse rotation + scale).
@@ -205,10 +290,10 @@ fn augment(image: &[f32], rng: &mut StdRng) -> Vec<f32> {
             if noise > 0.0 {
                 v += rng.random_range(-noise..noise);
             }
-            out[oy * IMG_WIDTH + ox] = v.clamp(0.0, 1.0);
+            // Pixels are produced in row-major order, so pushing keeps layout.
+            out.push(v.clamp(0.0, 1.0));
         }
     }
-    out
 }
 
 /// Build the CTC target tensors: padded targets `[B, S]` and target lengths

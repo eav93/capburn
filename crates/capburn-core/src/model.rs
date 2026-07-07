@@ -20,6 +20,8 @@ use burn::nn::{
 use burn::prelude::*;
 use burn::tensor::activation::log_softmax;
 
+use crate::image_ops::PreprocessMode;
+
 /// Feature channels produced by the CNN backbone.
 const CNN_OUT: usize = 128;
 
@@ -66,6 +68,9 @@ pub struct CaptchaModelConfig {
     /// Recognition head: `"fixed"` or `"ctc"`.
     #[config(default = "String::from(\"fixed\")")]
     pub arch: String,
+    /// Image preprocessing mode: `"stretch"` or `"fit"`.
+    #[config(default = "String::from(\"stretch\")")]
+    pub preprocess: String,
     #[config(default = 0.2)]
     pub dropout: f64,
 }
@@ -119,6 +124,7 @@ impl CaptchaModelConfig {
     /// positive length, dropout in range.
     pub fn validate(&self) -> Result<(), String> {
         Arch::parse(&self.arch)?;
+        PreprocessMode::parse(&self.preprocess)?;
         if self.num_chars == 0 {
             return Err("num_chars must be > 0".into());
         }

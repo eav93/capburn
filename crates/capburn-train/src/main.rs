@@ -1,11 +1,12 @@
 use burn::backend::Autodiff;
-use capburn_core::{CaptchaModelConfig, Charset, Recognizer};
+use capburn_core::{Arch, CTC_TIME_STEPS, CaptchaModelConfig, Charset, PreprocessMode, Recognizer};
 use clap::{Parser, Subcommand, ValueEnum};
 
 mod data;
 mod detect;
 mod training;
 
+use data::AugmentProfile;
 use training::TrainingConfig;
 
 #[derive(Parser)]
@@ -54,6 +55,10 @@ enum Cmd {
         /// or `ctc` (variable length / shifting positions).
         #[arg(long, default_value = "auto")]
         arch: String,
+        /// Image preprocessing: `auto`, `stretch` (resize exactly), or `fit`
+        /// (preserve aspect ratio and pad).
+        #[arg(long, default_value = "auto")]
+        preprocess: String,
         /// Compute backend.
         #[arg(long, value_enum, default_value_t = BackendKind::Wgpu)]
         backend: BackendKind,
@@ -63,7 +68,10 @@ enum Cmd {
         batch_size: usize,
         #[arg(long, default_value_t = 5.0e-4)]
         lr: f64,
-        /// Disable training-image augmentation (affine + photometric jitter).
+        /// Augmentation strength: `auto`, `light`, `medium`, `strong`, or `off`.
+        #[arg(long, default_value = "auto")]
+        augment: String,
+        /// Disable training-image augmentation (same as `--augment off`).
         #[arg(long)]
         no_augment: bool,
     },
@@ -86,15 +94,23 @@ fn main() {
             charset,
             num_chars,
             arch,
+            preprocess,
             backend,
             epochs,
             batch_size,
             lr,
+            augment,
             no_augment,
         } => {
             let data_dir = match &dataset {
                 Some(name) => format!("{data}/{name}"),
                 None => data.clone(),
+            };
+
+            // Clean CLI validation (no panic/backtrace).
+            let fail = |msg: String| -> ! {
+                eprintln!("Error: {msg}");
+                std::process::exit(1);
             };
 
             let charset_override = if charset.eq_ignore_ascii_case("auto") {
@@ -110,26 +126,126 @@ fn main() {
                 detect::detect_format(&data_dir, charset_override, length_override)
                     .expect("cannot read dataset folder");
 
-            // Auto: a single length → positional `fixed` head (stronger, faster);
-            // a length range → `ctc` for variable length.
+            let image_scan = if preprocess.eq_ignore_ascii_case("auto") {
+                let scan = detect::scan_images(&data_dir).expect("cannot scan dataset images");
+                print!(
+                    "Image scan: sampled {}/{}, {} decoded",
+                    scan.sampled, scan.total, scan.decoded
+                );
+                if scan.decode_failed > 0 {
+                    print!(", {} decode failed", scan.decode_failed);
+                }
+                print!(", dims:");
+                for ((w, h), count) in scan.dim_hist.iter().take(5) {
+                    print!(" {w}x{h}×{count}");
+                }
+                if scan.dim_hist.len() > 5 {
+                    print!(" …");
+                }
+                println!(
+                    ", mode {}x{}×{}, aspect {:.2}, color {:.1}%, ink {:.1}%",
+                    scan.mode_dim.0,
+                    scan.mode_dim.1,
+                    scan.mode_dim_count,
+                    scan.avg_aspect,
+                    scan.color_fraction * 100.0,
+                    scan.ink_fraction * 100.0
+                );
+                if scan.decode_failed > 0 {
+                    let fail_ratio = scan.decode_failed as f32 / scan.sampled.max(1) as f32;
+                    if fail_ratio > 0.05 {
+                        eprintln!(
+                            "Warning: {:.1}% of sampled images failed to decode; training will skip bad files",
+                            fail_ratio * 100.0
+                        );
+                    }
+                }
+                Some(scan)
+            } else {
+                None
+            };
+
+            let preprocess_mode = if preprocess.eq_ignore_ascii_case("auto") {
+                image_scan
+                    .as_ref()
+                    .map(detect::recommend_preprocess)
+                    .unwrap_or(PreprocessMode::Stretch)
+            } else {
+                PreprocessMode::parse(&preprocess).unwrap_or_else(|e| fail(e))
+            };
+
+            // Auto: fixed length → positional head; variable length → CTC.
+            // Use `--arch ctc` explicitly to A/B alignment-free training on a
+            // fixed-length dataset.
             let arch = if arch.eq_ignore_ascii_case("auto") {
-                if length.min_chars == length.max_chars {
-                    "fixed".to_string()
-                } else {
+                if length.min_chars != length.max_chars {
                     "ctc".to_string()
+                } else {
+                    "fixed".to_string()
                 }
             } else {
                 arch
             };
 
-            let model_cfg =
-                CaptchaModelConfig::new(charset.as_chars(), length.max_chars).with_arch(arch);
+            let (augment_enabled, augment_profile) =
+                if no_augment || augment.eq_ignore_ascii_case("off") {
+                    (false, AugmentProfile::Medium)
+                } else if augment.eq_ignore_ascii_case("auto") {
+                    (true, detect::recommend_augment())
+                } else {
+                    (
+                        true,
+                        AugmentProfile::parse(&augment).unwrap_or_else(|e| fail(e)),
+                    )
+                };
+
+            println!(
+                "Auto params: arch={}, preprocess={}, augment={}",
+                arch,
+                preprocess_mode.as_str(),
+                if augment_enabled {
+                    augment_profile.as_str()
+                } else {
+                    "off"
+                }
+            );
+
+            let arch_kind = Arch::parse(&arch).unwrap_or_else(|e| fail(e));
+            if epochs == 0 {
+                fail("--epochs must be > 0".into());
+            }
+            if batch_size == 0 {
+                fail("--batch-size must be > 0".into());
+            }
+            if !(lr.is_finite() && lr > 0.0) {
+                fail(format!("--lr must be a positive finite number, got {lr}"));
+            }
+            if arch_kind == Arch::Fixed && length.min_chars != length.max_chars {
+                fail(format!(
+                    "--arch fixed needs a single length, got {}..={} — use --arch ctc for a range",
+                    length.min_chars, length.max_chars
+                ));
+            }
+            // CTC needs a blank between adjacent equal characters, so the worst
+            // case (all-repeats, e.g. "00000") needs 2*len-1 time steps.
+            let ctc_worst_case_steps = length.max_chars.saturating_mul(2).saturating_sub(1);
+            if arch_kind == Arch::Ctc && ctc_worst_case_steps > CTC_TIME_STEPS {
+                fail(format!(
+                    "--num-chars max {} is too long for the CTC sequence length {} (needs 2*len-1 ≤ {})",
+                    length.max_chars, CTC_TIME_STEPS, CTC_TIME_STEPS
+                ));
+            }
+
+            let model_cfg = CaptchaModelConfig::new(charset.as_chars(), length.max_chars)
+                .with_arch(arch)
+                .with_preprocess(preprocess_mode.as_str().to_string());
             let cfg = TrainingConfig::new(model_cfg)
                 .with_min_chars(length.min_chars)
                 .with_num_epochs(epochs)
                 .with_batch_size(batch_size)
                 .with_learning_rate(lr)
-                .with_augment(!no_augment);
+                .with_augment(augment_enabled)
+                .with_augment_profile(augment_profile.as_str().to_string());
 
             run_training(backend, &out, &data_dir, cfg);
         }

@@ -1,9 +1,12 @@
-//! Auto-detect the captcha format from a dataset: length and charset from file names.
+//! Auto-detect the captcha format from a dataset: labels, image geometry and
+//! conservative training defaults.
 
-use crate::data::label_from_stem;
-use capburn_core::Charset;
+use crate::data::{AugmentProfile, label_from_stem};
+use capburn_core::{Charset, IMG_HEIGHT, IMG_WIDTH, PreprocessMode, inspect_image};
 use std::collections::HashMap;
 use std::path::Path;
+
+const IMAGE_SCAN_LIMIT: usize = 256;
 
 /// Result of scanning a dataset folder.
 pub struct Scan {
@@ -15,6 +18,32 @@ pub struct Scan {
     pub length_hist: Vec<(usize, usize)>,
     /// How many files were analyzed.
     pub considered: usize,
+}
+
+/// Result of scanning decoded images.
+pub struct ImageScan {
+    /// How many plausible files were available for image scan.
+    pub total: usize,
+    /// How many files were sampled for image scan.
+    pub sampled: usize,
+    /// How many images were decoded and inspected.
+    pub decoded: usize,
+    /// How many plausible image files failed to decode.
+    pub decode_failed: usize,
+    /// Image dimension distribution: (width, height) → number of files.
+    pub dim_hist: Vec<((u32, u32), usize)>,
+    /// Dominant image dimensions.
+    pub mode_dim: (u32, u32),
+    /// Number of images with the dominant dimensions.
+    pub mode_dim_count: usize,
+    /// Dominant raw source aspect ratio.
+    pub mode_aspect: f32,
+    /// Average raw source aspect ratio.
+    pub avg_aspect: f32,
+    /// Average fraction of visibly colored pixels.
+    pub color_fraction: f32,
+    /// Average fraction of non-background pixels.
+    pub ink_fraction: f32,
 }
 
 /// Whether a label is "plausible": non-empty and consisting of letters/digits
@@ -70,6 +99,95 @@ pub fn scan_folder<P: AsRef<Path>>(folder: P) -> std::io::Result<Scan> {
         length_hist,
         considered,
     })
+}
+
+/// Decode images and collect cheap visual statistics for auto-configuration.
+pub fn scan_images<P: AsRef<Path>>(folder: P) -> std::io::Result<ImageScan> {
+    let mut paths = Vec::new();
+    for entry in std::fs::read_dir(folder)? {
+        let entry = entry?;
+        let path = entry.path();
+        if path.is_file() {
+            let Some(stem) = path.file_stem().and_then(|s| s.to_str()) else {
+                continue;
+            };
+            if !is_plausible_label(label_from_stem(stem)) {
+                continue;
+            }
+            paths.push(path);
+        }
+    }
+    paths.sort();
+    let total = paths.len();
+    let sample_len = total.min(IMAGE_SCAN_LIMIT);
+
+    let mut dims: HashMap<(u32, u32), usize> = HashMap::new();
+    let mut decoded = 0usize;
+    let mut decode_failed = 0usize;
+    let mut aspect_sum = 0.0f32;
+    let mut color_sum = 0.0f32;
+    let mut ink_sum = 0.0f32;
+    for i in 0..sample_len {
+        let idx = if sample_len == total {
+            i
+        } else {
+            i * total / sample_len
+        };
+        let path = &paths[idx];
+        match inspect_image(path) {
+            Ok(info) => {
+                decoded += 1;
+                *dims.entry((info.width, info.height)).or_insert(0) += 1;
+                aspect_sum += info.width as f32 / info.height.max(1) as f32;
+                color_sum += info.color_fraction;
+                ink_sum += info.ink_fraction;
+            }
+            Err(_) => decode_failed += 1,
+        }
+    }
+
+    let mut dim_hist: Vec<((u32, u32), usize)> = dims.into_iter().collect();
+    dim_hist.sort_by_key(|((w, h), _)| (*w, *h));
+    let (mode_dim, mode_dim_count) = dim_hist
+        .iter()
+        .max_by_key(|(_, count)| *count)
+        .map(|(dim, count)| (*dim, *count))
+        .unwrap_or(((0, 0), 0));
+    let mode_aspect = mode_dim.0 as f32 / mode_dim.1.max(1) as f32;
+
+    Ok(ImageScan {
+        total,
+        sampled: sample_len,
+        decoded,
+        decode_failed,
+        dim_hist,
+        mode_dim,
+        mode_dim_count,
+        mode_aspect,
+        avg_aspect: aspect_sum / decoded.max(1) as f32,
+        color_fraction: color_sum / decoded.max(1) as f32,
+        ink_fraction: ink_sum / decoded.max(1) as f32,
+    })
+}
+
+/// Recommend preprocessing from source geometry. Historical exact resize is the
+/// default; `fit` is selected only for extreme aspect-ratio mismatch.
+pub fn recommend_preprocess(scan: &ImageScan) -> PreprocessMode {
+    if scan.decoded == 0 {
+        return PreprocessMode::Stretch;
+    }
+    let target_aspect = IMG_WIDTH as f32 / IMG_HEIGHT as f32;
+    let ratio = scan.mode_aspect / target_aspect;
+    if !(0.67..=1.50).contains(&ratio) {
+        PreprocessMode::Fit
+    } else {
+        PreprocessMode::Stretch
+    }
+}
+
+/// Conservative default until per-dataset A/B says otherwise.
+pub fn recommend_augment() -> AugmentProfile {
+    AugmentProfile::Medium
 }
 
 /// Chosen captcha length range. CTC handles variable length natively, so this is
