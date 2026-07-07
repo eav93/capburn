@@ -7,7 +7,7 @@
 # with it.
 #
 # Quick install:
-#   curl -fsSL https://raw.githubusercontent.com/eav93/capburn/main/install-capburn.sh | bash
+#   curl -fsSL https://raw.githubusercontent.com/eav93/capburn/main/install.sh | bash
 #
 # Options (flags or environment variables):
 #   --dest DIR         where to put the .so (default ./capburn, or $CAPBURN_DEST)
