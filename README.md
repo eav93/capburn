@@ -240,7 +240,34 @@ cargo build --release -p capburn_php
 Prebuilt binaries for each PHP version × platform are attached to every
 [GitHub Release](https://github.com/eav93/capburn/releases).
 
-### Install
+### Quick install
+
+Download the prebuilt extension for your PHP version and platform in one line —
+the script prints the exact `-d extension=…` command to run:
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/eav93/capburn/main/install-capburn.sh | bash
+# → ./capburn/capburn_php.so, then:
+#   php -d extension=/abs/path/capburn/capburn_php.so your-script.php
+```
+
+Pick a directory or version with flags:
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/eav93/capburn/main/install-capburn.sh \
+  | bash -s -- --dest /usr/local/lib/php --version v0.1.0
+```
+
+In a Dockerfile:
+
+```dockerfile
+RUN curl -fsSL https://raw.githubusercontent.com/eav93/capburn/main/install-capburn.sh \
+      | bash -s -- --dest /tmp/capburn \
+    && cp /tmp/capburn/capburn_php.so "$(php-config --extension-dir)/capburn_php.so" \
+    && docker-php-ext-enable capburn_php
+```
+
+### Install manually
 
 Either load it ad-hoc:
 
