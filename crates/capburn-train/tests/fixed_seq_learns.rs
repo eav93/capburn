@@ -45,7 +45,8 @@ fn synthetic_targets(device: &burn::backend::ndarray::NdArrayDevice) -> Tensor<A
 fn overfits(arch: &str) -> (f32, f32) {
     let device = burn::backend::ndarray::NdArrayDevice::Cpu;
     AB::seed(&device, 7);
-    let config = CaptchaModelConfig::new("0123456789".into(), NUM_CHARS).with_arch(arch.to_string());
+    let config =
+        CaptchaModelConfig::new("0123456789".into(), NUM_CHARS).with_arch(arch.to_string());
     config.validate().unwrap();
     let mut model = config.init::<AB>(&device);
 
@@ -77,7 +78,10 @@ fn overfits(arch: &str) -> (f32, f32) {
 #[test]
 fn fixed_seq_is_trainable() {
     let (initial, final_loss) = overfits("fixed-seq");
-    assert!(initial.is_finite() && final_loss.is_finite(), "loss went NaN");
+    assert!(
+        initial.is_finite() && final_loss.is_finite(),
+        "loss went NaN"
+    );
     assert!(
         final_loss < initial * 0.5,
         "fixed-seq did not learn: loss {initial:.4} -> {final_loss:.4}"
@@ -87,7 +91,10 @@ fn fixed_seq_is_trainable() {
 #[test]
 fn fixed_seq_pool_is_trainable() {
     let (initial, final_loss) = overfits("fixed-seq-pool");
-    assert!(initial.is_finite() && final_loss.is_finite(), "loss went NaN");
+    assert!(
+        initial.is_finite() && final_loss.is_finite(),
+        "loss went NaN"
+    );
     assert!(
         final_loss < initial * 0.5,
         "fixed-seq-pool did not learn: loss {initial:.4} -> {final_loss:.4}"
