@@ -22,7 +22,7 @@ jobs:
     name: Rust lint
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
 
       # php-config нужен build-скрипту ext-php-rs при сборке capburn-php.
       - name: Set up PHP
@@ -55,7 +55,7 @@ jobs:
           - { name: linux-x86_64, runner: ubuntu-latest }
           - { name: macos-aarch64, runner: macos-14 }
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
 
       - name: Set up PHP
         uses: shivammathur/setup-php@v2
