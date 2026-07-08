@@ -2,7 +2,7 @@
 //! conservative training defaults.
 
 use crate::data::{AugmentProfile, label_from_stem};
-use capburn_core::{Charset, IMG_HEIGHT, IMG_WIDTH, PreprocessMode, inspect_image};
+use capburn_core::{Charset, InputSize, PreprocessMode, inspect_image};
 use std::collections::HashMap;
 use std::path::Path;
 
@@ -172,17 +172,44 @@ pub fn scan_images<P: AsRef<Path>>(folder: P) -> std::io::Result<ImageScan> {
 
 /// Recommend preprocessing from source geometry. Historical exact resize is the
 /// default; `fit` is selected only for extreme aspect-ratio mismatch.
-pub fn recommend_preprocess(scan: &ImageScan) -> PreprocessMode {
+pub fn recommend_preprocess(scan: &ImageScan, target_size: InputSize) -> PreprocessMode {
     if scan.decoded == 0 {
         return PreprocessMode::Stretch;
     }
-    let target_aspect = IMG_WIDTH as f32 / IMG_HEIGHT as f32;
+    let target_aspect = target_size.width as f32 / target_size.height as f32;
     let ratio = scan.mode_aspect / target_aspect;
     if !(0.67..=1.50).contains(&ratio) {
         PreprocessMode::Fit
     } else {
         PreprocessMode::Stretch
     }
+}
+
+/// Recommend model input size from the dominant source image dimensions. Keeps
+/// normal captcha sizes close to native resolution, but caps very large images
+/// to avoid exploding memory and fixed-global parameter count.
+pub fn recommend_input_size(scan: &ImageScan) -> InputSize {
+    if scan.mode_dim.0 == 0 || scan.mode_dim.1 == 0 {
+        return InputSize::default();
+    }
+
+    const MAX_AUTO_PIXELS: usize = 32_768;
+    let mut width = scan.mode_dim.0 as usize;
+    let mut height = (scan.mode_dim.1 as usize).max(32);
+    let pixels = width.saturating_mul(height);
+    if pixels > MAX_AUTO_PIXELS {
+        let scale = (MAX_AUTO_PIXELS as f32 / pixels as f32).sqrt();
+        width = ((width as f32 * scale).round() as usize).max(32);
+        height = ((height as f32 * scale).round() as usize).max(32);
+    }
+
+    width = round_up_to_multiple(width, 4).min(512);
+    height = height.min(256);
+    InputSize::new(width, height)
+}
+
+fn round_up_to_multiple(value: usize, step: usize) -> usize {
+    value.div_ceil(step) * step
 }
 
 /// Conservative default until per-dataset A/B says otherwise.

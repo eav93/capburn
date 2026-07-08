@@ -1,4 +1,4 @@
-//! Captcha recognizer with a shared CNN backbone and two selectable heads.
+//! Captcha recognizer with a shared CNN backbone and selectable heads.
 //!
 //! * `fixed` — positional classifier: the CNN feature map is pooled into exactly
 //!   `num_chars` width slots and each slot is classified independently with
@@ -6,12 +6,16 @@
 //!   repeated characters (e.g. `00075`), and is fast at inference.
 //! * `fixed-global` — fixed-length classifier over the whole width. Useful when
 //!   characters are not aligned with equal-width slots.
+//! * `fixed-seq` — CRNN-like fixed classifier: lightweight temporal convolution
+//!   over the CNN width sequence, then a whole-sequence classifier.
+//! * `fixed-seq-pool` — temporal convolution over the width sequence, then the
+//!   positional slot classifier.
 //! * `ctc`   — a per-width-column classifier trained with CTC loss. Handles
 //!   variable length and shifting character positions without per-slot labels.
 //!
-//! Both heads share the same convolutional backbone. No RNN is used: recurrent
+//! All heads share the same convolutional backbone. No RNN is used: recurrent
 //! layers are prohibitively slow on the fusion-less wgpu backend used for
-//! headless training.
+//! headless training, so the sequence variants use temporal convolutions.
 
 use burn::nn::conv::{Conv2d, Conv2dConfig};
 use burn::nn::pool::{AdaptiveAvgPool2d, AdaptiveAvgPool2dConfig, MaxPool2d, MaxPool2dConfig};
@@ -22,15 +26,14 @@ use burn::nn::{
 use burn::prelude::*;
 use burn::tensor::activation::log_softmax;
 
-use crate::image_ops::PreprocessMode;
+use crate::image_ops::{InputSize, PreprocessMode};
 
 /// Feature channels produced by the CNN backbone.
 const CNN_OUT: usize = 128;
 
-/// Number of time steps the CTC head emits: the backbone halves the width twice
-/// (two 2×2 pools) and keeps it otherwise, so the sequence length is `W / 4`.
-/// The CTC target length must not exceed this.
-pub const CTC_TIME_STEPS: usize = crate::image_ops::IMG_WIDTH / 4;
+/// Number of time steps the default CTC head emits. For non-default input sizes,
+/// use `CaptchaModelConfig::ctc_time_steps()`.
+pub const CTC_TIME_STEPS: usize = InputSize::default().ctc_time_steps();
 
 /// Recognition head / training objective.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -39,6 +42,10 @@ pub enum Arch {
     Fixed,
     /// Whole-sequence classifier + cross-entropy (fixed length).
     FixedGlobal,
+    /// Temporal-conv sequence classifier + cross-entropy (fixed length).
+    FixedSeq,
+    /// Temporal-conv positional classifier + cross-entropy (fixed length).
+    FixedSeqPool,
     /// Per-column classifier + CTC loss (variable length).
     Ctc,
 }
@@ -48,9 +55,11 @@ impl Arch {
         match s.to_ascii_lowercase().as_str() {
             "fixed" => Ok(Arch::Fixed),
             "fixed-global" | "fixed_global" | "global" => Ok(Arch::FixedGlobal),
+            "fixed-seq" | "fixed_seq" | "seq" | "tcn" => Ok(Arch::FixedSeq),
+            "fixed-seq-pool" | "fixed_seq_pool" | "seq-pool" | "tcn-pool" => Ok(Arch::FixedSeqPool),
             "ctc" => Ok(Arch::Ctc),
             other => Err(format!(
-                "unknown arch {other:?} (expected 'fixed', 'fixed-global' or 'ctc')"
+                "unknown arch {other:?} (expected 'fixed', 'fixed-global', 'fixed-seq', 'fixed-seq-pool' or 'ctc')"
             )),
         }
     }
@@ -59,6 +68,8 @@ impl Arch {
         match self {
             Arch::Fixed => "fixed",
             Arch::FixedGlobal => "fixed-global",
+            Arch::FixedSeq => "fixed-seq",
+            Arch::FixedSeqPool => "fixed-seq-pool",
             Arch::Ctc => "ctc",
         }
     }
@@ -77,6 +88,12 @@ pub struct CaptchaModelConfig {
     /// Image preprocessing mode: `"stretch"` or `"fit"`.
     #[config(default = "String::from(\"stretch\")")]
     pub preprocess: String,
+    /// Model input width in pixels.
+    #[config(default = 128)]
+    pub input_width: usize,
+    /// Model input height in pixels.
+    #[config(default = 32)]
+    pub input_height: usize,
     #[config(default = 0.2)]
     pub dropout: f64,
     /// capburn version that trained the model (e.g. `"0.1.1"`). Used to reject a
@@ -117,7 +134,8 @@ mod version_tests {
 }
 
 /// Lenient view of `model.json`: every non-essential field has a default, so
-/// models written by an older capburn (missing fields added later) still load.
+/// models written by earlier capburn versions (missing fields added later)
+/// still load.
 #[derive(serde::Deserialize)]
 struct StoredModelConfig {
     charset: String,
@@ -126,6 +144,10 @@ struct StoredModelConfig {
     arch: String,
     #[serde(default = "default_preprocess")]
     preprocess: String,
+    #[serde(default = "default_input_width")]
+    input_width: usize,
+    #[serde(default = "default_input_height")]
+    input_height: usize,
     #[serde(default = "default_dropout")]
     dropout: f64,
     /// Absent in pre-versioning models → treated as compatible.
@@ -138,6 +160,12 @@ fn default_arch() -> String {
 }
 fn default_preprocess() -> String {
     "stretch".into()
+}
+fn default_input_width() -> usize {
+    crate::image_ops::IMG_WIDTH
+}
+fn default_input_height() -> usize {
+    crate::image_ops::IMG_HEIGHT
 }
 fn default_dropout() -> f64 {
     0.2
@@ -169,6 +197,8 @@ pub fn load_model_config<P: AsRef<std::path::Path>>(path: P) -> Result<CaptchaMo
     Ok(CaptchaModelConfig::new(stored.charset, stored.num_chars)
         .with_arch(stored.arch)
         .with_preprocess(stored.preprocess)
+        .with_input_width(stored.input_width)
+        .with_input_height(stored.input_height)
         .with_dropout(stored.dropout))
 }
 
@@ -194,6 +224,33 @@ impl<B: Backend> ConvBlock<B> {
     }
 }
 
+/// Residual temporal block over the CNN width sequence. The feature map height
+/// is already 1, so a 1x3 kernel behaves like a cheap 1D convolution over time.
+#[derive(Module, Debug)]
+struct TemporalBlock<B: Backend> {
+    conv: Conv2d<B>,
+    bn: BatchNorm<B>,
+}
+
+impl<B: Backend> TemporalBlock<B> {
+    fn new(channels: usize, device: &B::Device) -> Self {
+        Self {
+            conv: Conv2dConfig::new([channels, channels], [1, 3])
+                .with_padding(PaddingConfig2d::Same)
+                .init(device),
+            bn: BatchNormConfig::new(channels).init(device),
+        }
+    }
+
+    /// No dropout inside the block: the heads apply the configured dropout once,
+    /// so `--dropout` regularizes every architecture equally.
+    fn forward(&self, x: Tensor<B, 4>, act: &LeakyRelu) -> Tensor<B, 4> {
+        let residual = x.clone();
+        let y = act.forward(self.bn.forward(self.conv.forward(x)));
+        act.forward(residual + y)
+    }
+}
+
 #[derive(Module, Debug)]
 pub struct CaptchaModel<B: Backend> {
     b1: ConvBlock<B>,
@@ -204,17 +261,26 @@ pub struct CaptchaModel<B: Backend> {
     pool2x2: MaxPool2d,
     pool2x1: MaxPool2d,
     activation: LeakyRelu,
+    /// Collapses feature-map height to 1 and normalizes width to `time_steps`.
+    feature_pool: AdaptiveAvgPool2d,
     /// Pools the width into exactly `num_chars` slots (fixed head only).
     slot_pool: AdaptiveAvgPool2d,
     dropout: Dropout,
     fc: Linear<B>,
     fc_global: Option<Linear<B>>,
+    t1: Option<TemporalBlock<B>>,
+    t2: Option<TemporalBlock<B>>,
+    t3: Option<TemporalBlock<B>>,
     #[module(skip)]
     arch: Arch,
     #[module(skip)]
     num_chars: usize,
     #[module(skip)]
     num_classes: usize,
+    #[module(skip)]
+    input_size: InputSize,
+    #[module(skip)]
+    time_steps: usize,
 }
 
 impl CaptchaModelConfig {
@@ -223,6 +289,7 @@ impl CaptchaModelConfig {
     pub fn validate(&self) -> Result<(), String> {
         Arch::parse(&self.arch)?;
         PreprocessMode::parse(&self.preprocess)?;
+        self.input_size().validate()?;
         if self.num_chars == 0 {
             return Err("num_chars must be > 0".into());
         }
@@ -242,20 +309,36 @@ impl CaptchaModelConfig {
         Ok(())
     }
 
+    pub fn input_size(&self) -> InputSize {
+        InputSize::new(self.input_width, self.input_height)
+    }
+
+    pub fn ctc_time_steps(&self) -> usize {
+        self.input_size().ctc_time_steps()
+    }
+
     pub fn init<B: Backend>(&self, device: &B::Device) -> CaptchaModel<B> {
         let arch = Arch::parse(&self.arch).expect("invalid arch");
         let charset_len = self.charset.chars().count();
-        // CTC needs an extra blank class (last index); the fixed head does not.
+        let time_steps = self.ctc_time_steps();
+        // CTC needs an extra blank class (last index); fixed heads do not.
         let num_classes = match arch {
-            Arch::Fixed | Arch::FixedGlobal => charset_len,
+            Arch::Fixed | Arch::FixedGlobal | Arch::FixedSeq | Arch::FixedSeqPool => charset_len,
             Arch::Ctc => charset_len + 1,
         };
         let fc_global = match arch {
-            Arch::FixedGlobal => Some(
-                LinearConfig::new(CNN_OUT * CTC_TIME_STEPS, self.num_chars * num_classes)
-                    .init(device),
+            Arch::FixedGlobal | Arch::FixedSeq => Some(
+                LinearConfig::new(CNN_OUT * time_steps, self.num_chars * num_classes).init(device),
             ),
-            Arch::Fixed | Arch::Ctc => None,
+            Arch::Fixed | Arch::FixedSeqPool | Arch::Ctc => None,
+        };
+        let (t1, t2, t3) = match arch {
+            Arch::FixedSeq | Arch::FixedSeqPool => (
+                Some(TemporalBlock::new(CNN_OUT, device)),
+                Some(TemporalBlock::new(CNN_OUT, device)),
+                Some(TemporalBlock::new(CNN_OUT, device)),
+            ),
+            Arch::Fixed | Arch::FixedGlobal | Arch::Ctc => (None, None, None),
         };
         CaptchaModel {
             b1: ConvBlock::new(1, 32, device),
@@ -266,13 +349,19 @@ impl CaptchaModelConfig {
             pool2x2: MaxPool2dConfig::new([2, 2]).with_strides([2, 2]).init(),
             pool2x1: MaxPool2dConfig::new([2, 1]).with_strides([2, 1]).init(),
             activation: LeakyReluConfig::new().init(),
+            feature_pool: AdaptiveAvgPool2dConfig::new([1, time_steps]).init(),
             slot_pool: AdaptiveAvgPool2dConfig::new([1, self.num_chars]).init(),
             dropout: DropoutConfig::new(self.dropout).init(),
             fc: LinearConfig::new(CNN_OUT, num_classes).init(device),
             fc_global,
+            t1,
+            t2,
+            t3,
             arch,
             num_chars: self.num_chars,
             num_classes,
+            input_size: self.input_size(),
+            time_steps,
         }
     }
 }
@@ -290,13 +379,21 @@ impl<B: Backend> CaptchaModel<B> {
         self.num_classes
     }
 
+    pub fn input_size(&self) -> InputSize {
+        self.input_size
+    }
+
+    pub fn time_steps(&self) -> usize {
+        self.time_steps
+    }
+
     /// CTC blank class index (last class). Only meaningful for `Arch::Ctc`.
     pub fn blank(&self) -> usize {
         self.num_classes - 1
     }
 
-    /// Shared CNN backbone. Input `[B, 1, 32, 128]` → `[B, CNN_OUT, 1, 32]`
-    /// where the height is collapsed to 1 and the width becomes the sequence.
+    /// Shared CNN backbone. The height is collapsed to 1 and the width becomes
+    /// the sequence axis with `input_width / 4` time steps.
     fn backbone(&self, x: Tensor<B, 4>) -> Tensor<B, 4> {
         let x = self.b1.forward(x, &self.activation);
         let x = self.pool2x2.forward(x); // [B, 32, 16, 64]
@@ -307,7 +404,25 @@ impl<B: Backend> CaptchaModel<B> {
         let x = self.b4.forward(x, &self.activation);
         let x = self.pool2x1.forward(x); // [B, 128, 2, 32]
         let x = self.b5.forward(x, &self.activation);
-        self.pool2x1.forward(x) // [B, 128, 1, 32]
+        let x = self.pool2x1.forward(x);
+        self.feature_pool.forward(x) // [B, 128, 1, time_steps]
+    }
+
+    fn temporal_sequence(&self, x: Tensor<B, 4>) -> Tensor<B, 4> {
+        let x = self
+            .t1
+            .as_ref()
+            .expect("fixed-seq temporal block 1 is not initialized")
+            .forward(x, &self.activation);
+        let x = self
+            .t2
+            .as_ref()
+            .expect("fixed-seq temporal block 2 is not initialized")
+            .forward(x, &self.activation);
+        self.t3
+            .as_ref()
+            .expect("fixed-seq temporal block 3 is not initialized")
+            .forward(x, &self.activation)
     }
 
     /// Fixed head: logits of shape `[B, num_chars, num_classes]` (no softmax;
@@ -335,6 +450,44 @@ impl<B: Backend> CaptchaModel<B> {
             .expect("fixed-global head is not initialized")
             .forward(flat);
         logits.reshape([batch, self.num_chars, self.num_classes])
+    }
+
+    /// Fixed-seq head: run temporal residual convolutions over the width
+    /// sequence, then classify every output position from the whole sequence.
+    pub fn forward_fixed_seq(&self, x: Tensor<B, 4>) -> Tensor<B, 3> {
+        let feat = self.temporal_sequence(self.backbone(x)); // [B, C, 1, W']
+        let [batch, channels, _h, width] = feat.dims();
+        let flat = feat.reshape([batch, channels * width]);
+        let flat = self.dropout.forward(flat);
+        let logits = self
+            .fc_global
+            .as_ref()
+            .expect("fixed-seq global head is not initialized")
+            .forward(flat);
+        logits.reshape([batch, self.num_chars, self.num_classes])
+    }
+
+    /// Fixed-seq-pool head: run temporal residual convolutions, then pool the
+    /// sequence into character slots and classify each slot independently.
+    pub fn forward_fixed_seq_pool(&self, x: Tensor<B, 4>) -> Tensor<B, 3> {
+        let feat = self.temporal_sequence(self.backbone(x)); // [B, C, 1, W']
+        let pooled = self.slot_pool.forward(feat); // [B, C, 1, num_chars]
+        let [batch, channels, _h, slots] = pooled.dims();
+        let seq = pooled.reshape([batch, channels, slots]).swap_dims(1, 2);
+        let seq = self.dropout.forward(seq);
+        self.fc.forward(seq)
+    }
+
+    /// Dispatch over all fixed-length heads. CTC has a different output layout
+    /// and objective, so calling this for `Arch::Ctc` is a programmer error.
+    pub fn forward_fixed_logits(&self, x: Tensor<B, 4>) -> Tensor<B, 3> {
+        match self.arch {
+            Arch::Fixed => self.forward_fixed(x),
+            Arch::FixedGlobal => self.forward_fixed_global(x),
+            Arch::FixedSeq => self.forward_fixed_seq(x),
+            Arch::FixedSeqPool => self.forward_fixed_seq_pool(x),
+            Arch::Ctc => panic!("forward_fixed_logits called for ctc architecture"),
+        }
     }
 
     /// CTC head: log-probabilities of shape `[T, B, num_classes]` (time-major).

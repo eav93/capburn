@@ -3,8 +3,8 @@
 
 use crate::charset::Charset;
 use crate::image_ops::{
-    IMG_HEIGHT, IMG_WIDTH, PreprocessMode, image_to_floats_with_mode,
-    load_image_from_bytes_with_mode,
+    InputSize, PreprocessMode, image_to_floats_with_mode_and_size,
+    load_image_from_bytes_with_mode_and_size,
 };
 use crate::model::CaptchaModel;
 use burn::prelude::*;
@@ -17,6 +17,7 @@ pub struct Recognizer<B: Backend> {
     charset: Charset,
     num_chars: usize,
     preprocess: PreprocessMode,
+    input_size: InputSize,
     device: B::Device,
 }
 
@@ -37,6 +38,7 @@ impl<B: Backend> Recognizer<B> {
         let num_chars = config.num_chars;
         let preprocess = PreprocessMode::parse(&config.preprocess)
             .map_err(|e| format!("invalid model preprocess in {}: {e}", cfg_path.display()))?;
+        let input_size = config.input_size();
 
         let model: CaptchaModel<B> = config.init(&device);
         let record = CompactRecorder::new()
@@ -49,6 +51,7 @@ impl<B: Backend> Recognizer<B> {
             charset,
             num_chars,
             preprocess,
+            input_size,
             device,
         })
     }
@@ -60,16 +63,18 @@ impl<B: Backend> Recognizer<B> {
 
     fn recognize_floats(&self, data: Vec<f32>) -> String {
         let input = Tensor::<B, 4>::from_data(
-            TensorData::new(data, [1usize, 1, IMG_HEIGHT, IMG_WIDTH]),
+            TensorData::new(
+                data,
+                [1usize, 1, self.input_size.height, self.input_size.width],
+            ),
             &self.device,
         );
         let decoded = match self.model.arch() {
-            crate::Arch::Fixed => {
-                let logits = self.model.forward_fixed(input); // [1, N, C]
-                crate::model::fixed_decode_indices(logits)
-            }
-            crate::Arch::FixedGlobal => {
-                let logits = self.model.forward_fixed_global(input); // [1, N, C]
+            crate::Arch::Fixed
+            | crate::Arch::FixedGlobal
+            | crate::Arch::FixedSeq
+            | crate::Arch::FixedSeqPool => {
+                let logits = self.model.forward_fixed_logits(input); // [1, N, C]
                 crate::model::fixed_decode_indices(logits)
             }
             crate::Arch::Ctc => {
@@ -90,19 +95,28 @@ impl<B: Backend> Recognizer<B> {
 
     /// Recognize a captcha from a file.
     pub fn recognize_path<P: AsRef<Path>>(&self, path: P) -> Result<String, String> {
-        let data = crate::image_ops::load_image_as_floats_with_mode(path, self.preprocess)?;
+        let data = crate::image_ops::load_image_as_floats_with_mode_and_size(
+            path,
+            self.preprocess,
+            self.input_size,
+        )?;
         Ok(self.recognize_floats(data))
     }
 
     /// Recognize a captcha from in-memory image bytes (PNG/JPEG/…).
     pub fn recognize_bytes(&self, bytes: &[u8]) -> Result<String, String> {
-        let data = load_image_from_bytes_with_mode(bytes, self.preprocess)?;
+        let data =
+            load_image_from_bytes_with_mode_and_size(bytes, self.preprocess, self.input_size)?;
         Ok(self.recognize_floats(data))
     }
 
     /// Recognize an already-decoded image.
     pub fn recognize_image(&self, img: &image::DynamicImage) -> String {
-        self.recognize_floats(image_to_floats_with_mode(img, self.preprocess))
+        self.recognize_floats(image_to_floats_with_mode_and_size(
+            img,
+            self.preprocess,
+            self.input_size,
+        ))
     }
 }
 

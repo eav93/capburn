@@ -12,9 +12,11 @@ pub mod model;
 
 pub use charset::Charset;
 pub use image_ops::{
-    IMG_HEIGHT, IMG_WIDTH, ImageInfo, PreprocessMode, image_to_floats, image_to_floats_with_mode,
-    inspect_image, load_image_as_floats, load_image_as_floats_with_mode, load_image_from_bytes,
-    load_image_from_bytes_with_mode,
+    IMG_HEIGHT, IMG_WIDTH, ImageInfo, InputSize, PreprocessMode, image_to_floats,
+    image_to_floats_with_mode, image_to_floats_with_mode_and_size, inspect_image,
+    load_image_as_floats, load_image_as_floats_with_mode, load_image_as_floats_with_mode_and_size,
+    load_image_from_bytes, load_image_from_bytes_with_mode,
+    load_image_from_bytes_with_mode_and_size,
 };
 pub use inference::{CpuBackend, CpuRecognizer, Recognizer};
 pub use model::{

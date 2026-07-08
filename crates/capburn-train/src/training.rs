@@ -1,4 +1,4 @@
-//! Manual training loop for both heads (fixed / CTC).
+//! Manual training loop for fixed-length heads and CTC.
 //!
 //! A hand-written loop (instead of Burn's `Learner`) because the two objectives
 //! need different batching and full-captcha accuracy is measured by decoding the
@@ -60,14 +60,16 @@ pub fn run<B: AutodiffBackend>(
     let augment_profile =
         AugmentProfile::parse(&config.augment_profile).expect("invalid augment profile");
     let charset = Charset::from_chars(&config.model.charset);
+    let input_size = config.model.input_size();
     let min_len = config.min_chars;
     let max_len = config.model.num_chars;
     // Argument validity (arch/length compatibility, positive sizes) is checked
     // in main before we get here, with clean CLI errors.
 
     println!(
-        "Arch: {}  |  preprocess: {}  |  charset: {} chars ({})  |  length: {}",
+        "Arch: {}  |  input: {}  |  preprocess: {}  |  charset: {} chars ({})  |  length: {}",
         arch.as_str(),
+        input_size.as_string(),
         preprocess.as_str(),
         charset.len(),
         charset.describe_families(),
@@ -87,8 +89,10 @@ pub fn run<B: AutodiffBackend>(
     );
 
     print!("Loading and decoding images... ");
-    let mut dataset = Dataset::from_folder(data_dir, &charset, min_len, max_len, preprocess)
-        .expect("read dataset");
+    let _ = std::io::Write::flush(&mut std::io::stdout());
+    let mut dataset =
+        Dataset::from_folder(data_dir, &charset, min_len, max_len, preprocess, input_size)
+            .expect("read dataset");
     println!("{} examples", dataset.len());
     assert!(
         dataset.len() > 1,
@@ -129,20 +133,16 @@ pub fn run<B: AutodiffBackend>(
         let mut loss_reads = 0usize;
         for (batch_idx, batch) in train.examples().chunks(config.batch_size).enumerate() {
             let images = if config.augment {
-                build_images_aug::<B>(batch, &device, &mut aug_rng, augment_profile)
+                build_images_aug::<B>(batch, &device, &mut aug_rng, augment_profile, input_size)
             } else {
-                build_images::<B>(batch, &device)
+                build_images::<B>(batch, &device, input_size)
             };
             let (targets, target_lengths) = build_targets::<B>(batch, &device);
 
             let loss = match arch {
-                Arch::Fixed | Arch::FixedGlobal => {
+                Arch::Fixed | Arch::FixedGlobal | Arch::FixedSeq | Arch::FixedSeqPool => {
                     // All labels have length num_chars, so targets is [B, N].
-                    let logits = match arch {
-                        Arch::Fixed => model.forward_fixed(images),
-                        Arch::FixedGlobal => model.forward_fixed_global(images),
-                        Arch::Ctc => unreachable!(),
-                    }; // [B, N, C]
+                    let logits = model.forward_fixed_logits(images); // [B, N, C]
                     let [b, n, c] = logits.dims();
                     let logits_flat = logits.reshape([b * n, c]);
                     let targets_flat = targets.reshape([b * n]);
@@ -212,10 +212,11 @@ fn evaluate<B: AutodiffBackend>(
     let mut char_correct = 0usize;
     let mut char_total = 0usize;
     for batch in valid.examples().chunks(batch_size) {
-        let images = build_images::<B::InnerBackend>(batch, device);
+        let images = build_images::<B::InnerBackend>(batch, device, model.input_size());
         let decoded = match arch {
-            Arch::Fixed => fixed_decode_indices(eval_model.forward_fixed(images)),
-            Arch::FixedGlobal => fixed_decode_indices(eval_model.forward_fixed_global(images)),
+            Arch::Fixed | Arch::FixedGlobal | Arch::FixedSeq | Arch::FixedSeqPool => {
+                fixed_decode_indices(eval_model.forward_fixed_logits(images))
+            }
             Arch::Ctc => greedy_decode_indices(eval_model.forward_ctc(images), blank),
         };
         for (ex, seq) in batch.iter().zip(decoded) {

@@ -1,8 +1,8 @@
 [package]
 name = "capburn-train"
-version = "0.1.2"
+version = "0.2.0"
 edition = "2024"
-description = "Captcha recognizer trainer on Burn (GPU/CPU), CRNN + CTC"
+description = "Captcha recognizer trainer on Burn (GPU/CPU), fixed and CTC heads"
 license = "MIT"
 
 [[bin]]

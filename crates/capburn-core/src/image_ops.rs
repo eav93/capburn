@@ -5,16 +5,85 @@ use image::{DynamicImage, GrayImage, ImageReader, Limits, Luma};
 use std::io::Cursor;
 use std::path::Path;
 
-// Small input keeps training and CPU inference fast; captcha characters stay
+// Default input keeps training and CPU inference fast; captcha characters stay
 // legible at this size. The width becomes the sequence axis after the CNN.
 pub const IMG_WIDTH: usize = 128;
 pub const IMG_HEIGHT: usize = 32;
 
+/// Model input size. Width becomes the sequence axis after the CNN; height must
+/// be large enough for the backbone's five vertical pooling steps.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct InputSize {
+    pub width: usize,
+    pub height: usize,
+}
+
+impl InputSize {
+    pub const fn new(width: usize, height: usize) -> Self {
+        Self { width, height }
+    }
+
+    pub const fn default() -> Self {
+        Self::new(IMG_WIDTH, IMG_HEIGHT)
+    }
+
+    pub fn parse(s: &str) -> Result<Self, String> {
+        let Some((w, h)) = s.trim().split_once('x') else {
+            return Err(format!("invalid input size {s:?} (expected WIDTHxHEIGHT)"));
+        };
+        let width = w
+            .trim()
+            .parse()
+            .map_err(|_| format!("invalid input width in {s:?}"))?;
+        let height = h
+            .trim()
+            .parse()
+            .map_err(|_| format!("invalid input height in {s:?}"))?;
+        let size = Self::new(width, height);
+        size.validate()?;
+        Ok(size)
+    }
+
+    pub fn validate(self) -> Result<(), String> {
+        if self.width < 32 {
+            return Err(format!("input width must be >= 32, got {}", self.width));
+        }
+        if self.height < 32 {
+            return Err(format!("input height must be >= 32, got {}", self.height));
+        }
+        if self.width > 512 || self.height > 256 {
+            return Err(format!(
+                "input size {}x{} is too large (max 512x256)",
+                self.width, self.height
+            ));
+        }
+        if self.pixels() > 65_536 {
+            return Err(format!(
+                "input size {}x{} is too large (max 65536 pixels)",
+                self.width, self.height
+            ));
+        }
+        Ok(())
+    }
+
+    pub const fn pixels(self) -> usize {
+        self.width * self.height
+    }
+
+    pub const fn ctc_time_steps(self) -> usize {
+        self.width / 4
+    }
+
+    pub fn as_string(self) -> String {
+        format!("{}x{}", self.width, self.height)
+    }
+}
+
 /// How source images are mapped to the fixed model input size.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum PreprocessMode {
-    /// Resize exactly to 128x32. This is the historical behavior and keeps old
-    /// models compatible.
+    /// Resize exactly to 128x32. This is the default behavior and keeps
+    /// existing model files compatible.
     Stretch,
     /// Preserve source aspect ratio and center-pad to 128x32.
     Fit,
@@ -72,11 +141,21 @@ pub fn image_to_floats(img: &DynamicImage) -> Vec<f32> {
 
 /// Turn a decoded image into model input using the selected preprocessing mode.
 pub fn image_to_floats_with_mode(img: &DynamicImage, mode: PreprocessMode) -> Vec<f32> {
+    image_to_floats_with_mode_and_size(img, mode, InputSize::default())
+}
+
+/// Turn a decoded image into model input using the selected preprocessing mode
+/// and input size.
+pub fn image_to_floats_with_mode_and_size(
+    img: &DynamicImage,
+    mode: PreprocessMode,
+    size: InputSize,
+) -> Vec<f32> {
     let gray = match mode {
         PreprocessMode::Stretch => img
-            .resize_exact(IMG_WIDTH as u32, IMG_HEIGHT as u32, FilterType::Triangle)
+            .resize_exact(size.width as u32, size.height as u32, FilterType::Triangle)
             .to_luma8(),
-        PreprocessMode::Fit => resize_fit(img),
+        PreprocessMode::Fit => resize_fit(img, size),
     };
     gray.as_raw().iter().map(|p| *p as f32 / 255.0).collect()
 }
@@ -92,6 +171,15 @@ pub fn load_image_as_floats_with_mode<P: AsRef<Path>>(
     path: P,
     mode: PreprocessMode,
 ) -> Result<Vec<f32>, String> {
+    load_image_as_floats_with_mode_and_size(path, mode, InputSize::default())
+}
+
+/// Load an image from disk and convert it with the selected mode and input size.
+pub fn load_image_as_floats_with_mode_and_size<P: AsRef<Path>>(
+    path: P,
+    mode: PreprocessMode,
+    size: InputSize,
+) -> Result<Vec<f32>, String> {
     let mut reader = ImageReader::open(path.as_ref())
         .map_err(|e| format!("cannot open {}: {e}", path.as_ref().display()))?
         .with_guessed_format()
@@ -100,7 +188,7 @@ pub fn load_image_as_floats_with_mode<P: AsRef<Path>>(
     let img = reader
         .decode()
         .map_err(|e| format!("cannot decode image: {e}"))?;
-    Ok(image_to_floats_with_mode(&img, mode))
+    Ok(image_to_floats_with_mode_and_size(&img, mode, size))
 }
 
 /// Decode an image from in-memory bytes (for the PHP extension) and convert it
@@ -114,6 +202,16 @@ pub fn load_image_from_bytes_with_mode(
     bytes: &[u8],
     mode: PreprocessMode,
 ) -> Result<Vec<f32>, String> {
+    load_image_from_bytes_with_mode_and_size(bytes, mode, InputSize::default())
+}
+
+/// Decode an image from in-memory bytes and convert it with the selected mode
+/// and input size.
+pub fn load_image_from_bytes_with_mode_and_size(
+    bytes: &[u8],
+    mode: PreprocessMode,
+    size: InputSize,
+) -> Result<Vec<f32>, String> {
     let mut reader = ImageReader::new(Cursor::new(bytes))
         .with_guessed_format()
         .map_err(|e| format!("cannot guess image format: {e}"))?;
@@ -121,7 +219,7 @@ pub fn load_image_from_bytes_with_mode(
     let img = reader
         .decode()
         .map_err(|e| format!("cannot decode image from bytes: {e}"))?;
-    Ok(image_to_floats_with_mode(&img, mode))
+    Ok(image_to_floats_with_mode_and_size(&img, mode, size))
 }
 
 /// Inspect a decoded image without applying the model preprocessing.
@@ -167,19 +265,19 @@ pub fn inspect_image<P: AsRef<Path>>(path: P) -> Result<ImageInfo, String> {
     })
 }
 
-fn resize_fit(img: &DynamicImage) -> GrayImage {
+fn resize_fit(img: &DynamicImage, size: InputSize) -> GrayImage {
     let gray = img.to_luma8();
     let (src_w, src_h) = gray.dimensions();
     let scale =
-        (IMG_WIDTH as f32 / src_w.max(1) as f32).min(IMG_HEIGHT as f32 / src_h.max(1) as f32);
-    let new_w = ((src_w as f32 * scale).round() as u32).clamp(1, IMG_WIDTH as u32);
-    let new_h = ((src_h as f32 * scale).round() as u32).clamp(1, IMG_HEIGHT as u32);
+        (size.width as f32 / src_w.max(1) as f32).min(size.height as f32 / src_h.max(1) as f32);
+    let new_w = ((src_w as f32 * scale).round() as u32).clamp(1, size.width as u32);
+    let new_h = ((src_h as f32 * scale).round() as u32).clamp(1, size.height as u32);
 
     let resized = imageops::resize(&gray, new_w, new_h, FilterType::Triangle);
     let bg = estimate_background(&gray);
-    let mut out = GrayImage::from_pixel(IMG_WIDTH as u32, IMG_HEIGHT as u32, Luma([bg]));
-    let x = (IMG_WIDTH as u32 - new_w) / 2;
-    let y = (IMG_HEIGHT as u32 - new_h) / 2;
+    let mut out = GrayImage::from_pixel(size.width as u32, size.height as u32, Luma([bg]));
+    let x = (size.width as u32 - new_w) / 2;
+    let y = (size.height as u32 - new_h) / 2;
     imageops::replace(&mut out, &resized, x.into(), y.into());
     out
 }

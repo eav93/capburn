@@ -3,13 +3,12 @@
 
 use burn::prelude::*;
 use capburn_core::Charset;
-use capburn_core::image_ops::{
-    IMG_HEIGHT, IMG_WIDTH, PreprocessMode, load_image_as_floats_with_mode,
-};
+use capburn_core::image_ops::{InputSize, PreprocessMode, load_image_as_floats_with_mode_and_size};
 use rand::RngExt;
 use rand::SeedableRng;
 use rand::rngs::StdRng;
 use rand::seq::SliceRandom;
+use std::io::Write;
 use std::path::Path;
 
 /// One preloaded example: grayscale image floats and label class indices.
@@ -120,16 +119,19 @@ impl Dataset {
         min_len: usize,
         max_len: usize,
         preprocess: PreprocessMode,
+        input_size: InputSize,
     ) -> std::io::Result<Self> {
         let mut examples = Vec::new();
         let mut skipped = 0usize;
         let mut decode_failed = 0usize;
+        let mut scanned = 0usize;
         for entry in std::fs::read_dir(folder)? {
             let entry = entry?;
             let path = entry.path();
             if !path.is_file() {
                 continue;
             }
+            scanned += 1;
             let Some(stem) = path.file_stem().and_then(|s| s.to_str()) else {
                 continue;
             };
@@ -156,7 +158,8 @@ impl Dataset {
             }
             // Skip unreadable/corrupt files (e.g. a `12345.txt` whose stem looks
             // like a label) instead of killing the whole training run.
-            let image = match load_image_as_floats_with_mode(&path, preprocess) {
+            let image = match load_image_as_floats_with_mode_and_size(&path, preprocess, input_size)
+            {
                 Ok(img) => img,
                 Err(e) => {
                     decode_failed += 1;
@@ -167,6 +170,16 @@ impl Dataset {
                 }
             };
             examples.push(Example { image, labels });
+
+            if scanned.is_multiple_of(500) {
+                eprintln!(
+                    "Decode progress: scanned {scanned} files, usable {}, skipped {}, decode failed {}",
+                    examples.len(),
+                    skipped,
+                    decode_failed
+                );
+                let _ = std::io::stderr().flush();
+            }
         }
         if skipped > 0 {
             println!(
@@ -221,14 +234,18 @@ impl Dataset {
 }
 
 /// Build the image tensor `[B, 1, H, W]` for a slice of examples.
-pub fn build_images<B: Backend>(batch: &[Example], device: &B::Device) -> Tensor<B, 4> {
+pub fn build_images<B: Backend>(
+    batch: &[Example],
+    device: &B::Device,
+    input_size: InputSize,
+) -> Tensor<B, 4> {
     let bsz = batch.len();
-    let mut data = Vec::with_capacity(bsz * IMG_HEIGHT * IMG_WIDTH);
+    let mut data = Vec::with_capacity(bsz * input_size.pixels());
     for ex in batch {
         data.extend_from_slice(&ex.image);
     }
     Tensor::from_data(
-        TensorData::new(data, [bsz, 1, IMG_HEIGHT, IMG_WIDTH]),
+        TensorData::new(data, [bsz, 1, input_size.height, input_size.width]),
         device,
     )
 }
@@ -241,24 +258,31 @@ pub fn build_images_aug<B: Backend>(
     device: &B::Device,
     rng: &mut StdRng,
     profile: AugmentProfile,
+    input_size: InputSize,
 ) -> Tensor<B, 4> {
     let bsz = batch.len();
-    let mut data = Vec::with_capacity(bsz * IMG_HEIGHT * IMG_WIDTH);
+    let mut data = Vec::with_capacity(bsz * input_size.pixels());
     for ex in batch {
-        augment_into(&ex.image, &mut data, rng, profile);
+        augment_into(&ex.image, &mut data, rng, profile, input_size);
     }
     Tensor::from_data(
-        TensorData::new(data, [bsz, 1, IMG_HEIGHT, IMG_WIDTH]),
+        TensorData::new(data, [bsz, 1, input_size.height, input_size.width]),
         device,
     )
 }
 
 /// Apply a random affine warp and photometric jitter to one grayscale image
-/// (`IMG_HEIGHT * IMG_WIDTH` floats), appending the result to `out`. Border
+/// (`input_size.height * input_size.width` floats), appending the result to `out`. Border
 /// pixels are replicated, so no fixed background color is assumed.
-fn augment_into(image: &[f32], out: &mut Vec<f32>, rng: &mut StdRng, profile: AugmentProfile) {
+fn augment_into(
+    image: &[f32],
+    out: &mut Vec<f32>,
+    rng: &mut StdRng,
+    profile: AugmentProfile,
+    input_size: InputSize,
+) {
     let params = profile.params();
-    let (h, w) = (IMG_HEIGHT as f32, IMG_WIDTH as f32);
+    let (h, w) = (input_size.height as f32, input_size.width as f32);
     let (cx, cy) = (w / 2.0, h / 2.0);
 
     let angle = rng.random_range(-params.max_angle..params.max_angle);
@@ -273,18 +297,18 @@ fn augment_into(image: &[f32], out: &mut Vec<f32>, rng: &mut StdRng, profile: Au
     let brightness = rng.random_range(-params.max_brightness..params.max_brightness);
     let noise = rng.random_range(0.0f32..params.max_noise);
 
-    out.reserve(IMG_HEIGHT * IMG_WIDTH);
-    for oy in 0..IMG_HEIGHT {
-        for ox in 0..IMG_WIDTH {
+    out.reserve(input_size.pixels());
+    for oy in 0..input_size.height {
+        for ox in 0..input_size.width {
             // Map output pixel back to the source (inverse rotation + scale).
             let dx = ox as f32 - cx - tx;
             let dy = oy as f32 - cy - ty;
             let sx = (cos * dx + sin * dy) / scale + cx;
             let sy = (-sin * dx + cos * dy) / scale + cy;
             // Nearest neighbour with border replication.
-            let ix = (sx.round() as i32).clamp(0, IMG_WIDTH as i32 - 1) as usize;
-            let iy = (sy.round() as i32).clamp(0, IMG_HEIGHT as i32 - 1) as usize;
-            let mut v = image[iy * IMG_WIDTH + ix];
+            let ix = (sx.round() as i32).clamp(0, input_size.width as i32 - 1) as usize;
+            let iy = (sy.round() as i32).clamp(0, input_size.height as i32 - 1) as usize;
+            let mut v = image[iy * input_size.width + ix];
             // Photometric jitter.
             v = (v - 0.5) * contrast + 0.5 + brightness;
             if noise > 0.0 {
