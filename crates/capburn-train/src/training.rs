@@ -136,9 +136,13 @@ pub fn run<B: AutodiffBackend>(
             let (targets, target_lengths) = build_targets::<B>(batch, &device);
 
             let loss = match arch {
-                Arch::Fixed => {
+                Arch::Fixed | Arch::FixedGlobal => {
                     // All labels have length num_chars, so targets is [B, N].
-                    let logits = model.forward_fixed(images); // [B, N, C]
+                    let logits = match arch {
+                        Arch::Fixed => model.forward_fixed(images),
+                        Arch::FixedGlobal => model.forward_fixed_global(images),
+                        Arch::Ctc => unreachable!(),
+                    }; // [B, N, C]
                     let [b, n, c] = logits.dims();
                     let logits_flat = logits.reshape([b * n, c]);
                     let targets_flat = targets.reshape([b * n]);
@@ -211,6 +215,7 @@ fn evaluate<B: AutodiffBackend>(
         let images = build_images::<B::InnerBackend>(batch, device);
         let decoded = match arch {
             Arch::Fixed => fixed_decode_indices(eval_model.forward_fixed(images)),
+            Arch::FixedGlobal => fixed_decode_indices(eval_model.forward_fixed_global(images)),
             Arch::Ctc => greedy_decode_indices(eval_model.forward_ctc(images), blank),
         };
         for (ex, seq) in batch.iter().zip(decoded) {

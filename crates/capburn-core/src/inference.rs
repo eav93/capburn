@@ -6,8 +6,7 @@ use crate::image_ops::{
     IMG_HEIGHT, IMG_WIDTH, PreprocessMode, image_to_floats_with_mode,
     load_image_from_bytes_with_mode,
 };
-use crate::model::{CaptchaModel, CaptchaModelConfig};
-use burn::config::Config;
+use crate::model::CaptchaModel;
 use burn::prelude::*;
 use burn::record::{CompactRecorder, Recorder};
 use std::path::Path;
@@ -27,8 +26,9 @@ impl<B: Backend> Recognizer<B> {
     pub fn load<P: AsRef<Path>>(artifact_dir: P, device: B::Device) -> Result<Self, String> {
         let dir = artifact_dir.as_ref();
         let cfg_path = dir.join("model.json");
-        let config = CaptchaModelConfig::load(&cfg_path)
-            .map_err(|e| format!("cannot read {}: {e}", cfg_path.display()))?;
+        // Lenient load: fills defaults for fields added in newer versions, and
+        // rejects a model newer than this build supports with a clear message.
+        let config = crate::model::load_model_config(&cfg_path)?;
         config
             .validate()
             .map_err(|e| format!("invalid model config in {}: {e}", cfg_path.display()))?;
@@ -66,6 +66,10 @@ impl<B: Backend> Recognizer<B> {
         let decoded = match self.model.arch() {
             crate::Arch::Fixed => {
                 let logits = self.model.forward_fixed(input); // [1, N, C]
+                crate::model::fixed_decode_indices(logits)
+            }
+            crate::Arch::FixedGlobal => {
+                let logits = self.model.forward_fixed_global(input); // [1, N, C]
                 crate::model::fixed_decode_indices(logits)
             }
             crate::Arch::Ctc => {

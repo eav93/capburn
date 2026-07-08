@@ -18,6 +18,6 @@ pub use image_ops::{
 };
 pub use inference::{CpuBackend, CpuRecognizer, Recognizer};
 pub use model::{
-    Arch, CTC_TIME_STEPS, CaptchaModel, CaptchaModelConfig, fixed_decode_indices,
-    greedy_decode_indices,
+    Arch, CTC_TIME_STEPS, CaptchaModel, CaptchaModelConfig, current_version, fixed_decode_indices,
+    greedy_decode_indices, load_model_config,
 };

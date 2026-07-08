@@ -51,8 +51,7 @@ enum Cmd {
         #[arg(long)]
         num_chars: Option<String>,
         /// Recognition head: `auto` (fixed for a single length, ctc for a
-        /// range), `fixed` (positional classifier, best for fixed length),
-        /// or `ctc` (variable length / shifting positions).
+        /// range), `fixed`, `fixed-global`, or `ctc`.
         #[arg(long, default_value = "auto")]
         arch: String,
         /// Image preprocessing: `auto`, `stretch` (resize exactly), or `fit`
@@ -68,6 +67,9 @@ enum Cmd {
         batch_size: usize,
         #[arg(long, default_value_t = 5.0e-4)]
         lr: f64,
+        /// Dropout probability used by the recognition head.
+        #[arg(long, default_value_t = 0.2)]
+        dropout: f64,
         /// Augmentation strength: `auto`, `light`, `medium`, `strong`, or `off`.
         #[arg(long, default_value = "auto")]
         augment: String,
@@ -99,6 +101,7 @@ fn main() {
             epochs,
             batch_size,
             lr,
+            dropout,
             augment,
             no_augment,
         } => {
@@ -220,10 +223,17 @@ fn main() {
             if !(lr.is_finite() && lr > 0.0) {
                 fail(format!("--lr must be a positive finite number, got {lr}"));
             }
-            if arch_kind == Arch::Fixed && length.min_chars != length.max_chars {
+            if !(dropout.is_finite() && (0.0..1.0).contains(&dropout)) {
                 fail(format!(
-                    "--arch fixed needs a single length, got {}..={} — use --arch ctc for a range",
-                    length.min_chars, length.max_chars
+                    "--dropout must be a finite number in [0, 1), got {dropout}"
+                ));
+            }
+            if arch_kind != Arch::Ctc && length.min_chars != length.max_chars {
+                fail(format!(
+                    "--arch {} needs a single length, got {}..={} — use --arch ctc for a range",
+                    arch_kind.as_str(),
+                    length.min_chars,
+                    length.max_chars
                 ));
             }
             // CTC needs a blank between adjacent equal characters, so the worst
@@ -238,7 +248,8 @@ fn main() {
 
             let model_cfg = CaptchaModelConfig::new(charset.as_chars(), length.max_chars)
                 .with_arch(arch)
-                .with_preprocess(preprocess_mode.as_str().to_string());
+                .with_preprocess(preprocess_mode.as_str().to_string())
+                .with_dropout(dropout);
             let cfg = TrainingConfig::new(model_cfg)
                 .with_min_chars(length.min_chars)
                 .with_num_epochs(epochs)
@@ -246,6 +257,12 @@ fn main() {
                 .with_learning_rate(lr)
                 .with_augment(augment_enabled)
                 .with_augment_profile(augment_profile.as_str().to_string());
+
+            if std::path::Path::new(&out).join("model.mpk").exists() {
+                eprintln!(
+                    "Warning: {out}/model.mpk already exists and will be overwritten by this training run"
+                );
+            }
 
             run_training(backend, &out, &data_dir, cfg);
         }

@@ -4,6 +4,8 @@
 //!   `num_chars` width slots and each slot is classified independently with
 //!   cross-entropy. Best for fixed-length captchas — trains stably, handles
 //!   repeated characters (e.g. `00075`), and is fast at inference.
+//! * `fixed-global` — fixed-length classifier over the whole width. Useful when
+//!   characters are not aligned with equal-width slots.
 //! * `ctc`   — a per-width-column classifier trained with CTC loss. Handles
 //!   variable length and shifting character positions without per-slot labels.
 //!
@@ -35,6 +37,8 @@ pub const CTC_TIME_STEPS: usize = crate::image_ops::IMG_WIDTH / 4;
 pub enum Arch {
     /// Positional classifier + cross-entropy (fixed length).
     Fixed,
+    /// Whole-sequence classifier + cross-entropy (fixed length).
+    FixedGlobal,
     /// Per-column classifier + CTC loss (variable length).
     Ctc,
 }
@@ -43,9 +47,10 @@ impl Arch {
     pub fn parse(s: &str) -> Result<Self, String> {
         match s.to_ascii_lowercase().as_str() {
             "fixed" => Ok(Arch::Fixed),
+            "fixed-global" | "fixed_global" | "global" => Ok(Arch::FixedGlobal),
             "ctc" => Ok(Arch::Ctc),
             other => Err(format!(
-                "unknown arch {other:?} (expected 'fixed' or 'ctc')"
+                "unknown arch {other:?} (expected 'fixed', 'fixed-global' or 'ctc')"
             )),
         }
     }
@@ -53,6 +58,7 @@ impl Arch {
     pub fn as_str(self) -> &'static str {
         match self {
             Arch::Fixed => "fixed",
+            Arch::FixedGlobal => "fixed-global",
             Arch::Ctc => "ctc",
         }
     }
@@ -73,6 +79,97 @@ pub struct CaptchaModelConfig {
     pub preprocess: String,
     #[config(default = 0.2)]
     pub dropout: f64,
+    /// capburn version that trained the model (e.g. `"0.1.1"`). Used to reject a
+    /// model built by a newer major/minor than this build (see `load_model_config`).
+    #[config(default = "crate::model::current_version()")]
+    pub version: String,
+}
+
+/// The capburn version of this build (from `CARGO_PKG_VERSION`).
+pub fn current_version() -> String {
+    env!("CARGO_PKG_VERSION").to_string()
+}
+
+/// Parse `"major.minor.patch"` into `(major, minor)`; patch and any suffix are
+/// ignored. Missing/garbage parts read as 0.
+fn major_minor(version: &str) -> (u32, u32) {
+    let mut parts = version.trim().split('.');
+    let major = parts.next().and_then(|s| s.parse().ok()).unwrap_or(0);
+    let minor = parts.next().and_then(|s| s.parse().ok()).unwrap_or(0);
+    (major, minor)
+}
+
+#[cfg(test)]
+mod version_tests {
+    use super::major_minor;
+
+    #[test]
+    fn compares_major_minor_ignoring_patch() {
+        // patch difference → equal
+        assert_eq!(major_minor("0.1.1"), major_minor("0.1.99"));
+        // minor newer
+        assert!(major_minor("0.2.0") > major_minor("0.1.9"));
+        // major newer
+        assert!(major_minor("1.0.0") > major_minor("0.9.9"));
+        // garbage → zeros
+        assert_eq!(major_minor("x"), (0, 0));
+    }
+}
+
+/// Lenient view of `model.json`: every non-essential field has a default, so
+/// models written by an older capburn (missing fields added later) still load.
+#[derive(serde::Deserialize)]
+struct StoredModelConfig {
+    charset: String,
+    num_chars: usize,
+    #[serde(default = "default_arch")]
+    arch: String,
+    #[serde(default = "default_preprocess")]
+    preprocess: String,
+    #[serde(default = "default_dropout")]
+    dropout: f64,
+    /// Absent in pre-versioning models → treated as compatible.
+    #[serde(default)]
+    version: Option<String>,
+}
+
+fn default_arch() -> String {
+    "fixed".into()
+}
+fn default_preprocess() -> String {
+    "stretch".into()
+}
+fn default_dropout() -> f64 {
+    0.2
+}
+
+/// Load `model.json` tolerantly: fills defaults for fields added in later
+/// versions, and rejects a model whose major/minor version is newer than this
+/// build (patch differences are ignored) with a hint to update the extension,
+/// instead of a cryptic serde error.
+pub fn load_model_config<P: AsRef<std::path::Path>>(path: P) -> Result<CaptchaModelConfig, String> {
+    let path = path.as_ref();
+    let text = std::fs::read_to_string(path)
+        .map_err(|e| format!("cannot read {}: {e}", path.display()))?;
+    let stored: StoredModelConfig =
+        serde_json::from_str(&text).map_err(|e| format!("cannot parse {}: {e}", path.display()))?;
+
+    if let Some(model_version) = &stored.version {
+        // Compare major.minor only; a patch bump is format-compatible.
+        if major_minor(model_version) > major_minor(&current_version()) {
+            return Err(format!(
+                "model {} was trained by capburn {} but this build is {} — update the capburn extension (see install.sh)",
+                path.display(),
+                model_version,
+                current_version()
+            ));
+        }
+    }
+
+    Ok(CaptchaModelConfig::new(stored.charset, stored.num_chars)
+        .with_arch(stored.arch)
+        .with_preprocess(stored.preprocess)
+        .with_dropout(stored.dropout))
 }
 
 /// A conv + batch-norm block; pooling is applied separately.
@@ -111,6 +208,7 @@ pub struct CaptchaModel<B: Backend> {
     slot_pool: AdaptiveAvgPool2d,
     dropout: Dropout,
     fc: Linear<B>,
+    fc_global: Option<Linear<B>>,
     #[module(skip)]
     arch: Arch,
     #[module(skip)]
@@ -149,8 +247,15 @@ impl CaptchaModelConfig {
         let charset_len = self.charset.chars().count();
         // CTC needs an extra blank class (last index); the fixed head does not.
         let num_classes = match arch {
-            Arch::Fixed => charset_len,
+            Arch::Fixed | Arch::FixedGlobal => charset_len,
             Arch::Ctc => charset_len + 1,
+        };
+        let fc_global = match arch {
+            Arch::FixedGlobal => Some(
+                LinearConfig::new(CNN_OUT * CTC_TIME_STEPS, self.num_chars * num_classes)
+                    .init(device),
+            ),
+            Arch::Fixed | Arch::Ctc => None,
         };
         CaptchaModel {
             b1: ConvBlock::new(1, 32, device),
@@ -164,6 +269,7 @@ impl CaptchaModelConfig {
             slot_pool: AdaptiveAvgPool2dConfig::new([1, self.num_chars]).init(),
             dropout: DropoutConfig::new(self.dropout).init(),
             fc: LinearConfig::new(CNN_OUT, num_classes).init(device),
+            fc_global,
             arch,
             num_chars: self.num_chars,
             num_classes,
@@ -214,6 +320,21 @@ impl<B: Backend> CaptchaModel<B> {
         let seq = pooled.reshape([batch, channels, slots]).swap_dims(1, 2);
         let seq = self.dropout.forward(seq);
         self.fc.forward(seq) // [B, N, num_classes]
+    }
+
+    /// Fixed-global head: classify every output position from the whole feature
+    /// sequence instead of assuming equal-width slots.
+    pub fn forward_fixed_global(&self, x: Tensor<B, 4>) -> Tensor<B, 3> {
+        let feat = self.backbone(x); // [B, C, 1, W']
+        let [batch, channels, _h, width] = feat.dims();
+        let flat = feat.reshape([batch, channels * width]);
+        let flat = self.dropout.forward(flat);
+        let logits = self
+            .fc_global
+            .as_ref()
+            .expect("fixed-global head is not initialized")
+            .forward(flat);
+        logits.reshape([batch, self.num_chars, self.num_classes])
     }
 
     /// CTC head: log-probabilities of shape `[T, B, num_classes]` (time-major).
