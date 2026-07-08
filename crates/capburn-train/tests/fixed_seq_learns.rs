@@ -3,7 +3,6 @@
 //! which can only happen if gradients flow through the temporal blocks.
 
 use burn::backend::{Autodiff, NdArray};
-use burn::module::AutodiffModule;
 use burn::nn::loss::CrossEntropyLossConfig;
 use burn::optim::{AdamConfig, GradientsParams, Optimizer};
 use burn::prelude::*;
